@@ -5,7 +5,6 @@ maintains fresh per-entity features, and serves them with **sub-millisecond
 point reads** to a lightweight inference step. The latency and freshness of
 feature retrieval is the thing we showcase.
 
-Speaker notes: [`speaker-notes/01-fast-feature-store.md`](speaker-notes/01-fast-feature-store.md) ·
 Measured numbers: [`docs/RESULTS.md`](docs/RESULTS.md) ·
 Why this dataset: [`docs/DATASET.md`](docs/DATASET.md)
 
