@@ -1,0 +1,79 @@
+# 3-node ScyllaDB cluster for the feature-store demo.
+# Runs on the demo host. Each node is constrained so three fit comfortably next to
+# the existing qdrant container (host has 24 cores / 183 GB).
+#
+#   docker compose -p fsdemo up -d
+#
+# The app connects from the host to the bridge IPs the driver discovers
+# (reachable directly on Linux), so no host port mapping is required for CQL.
+# We expose node1's 9042 anyway for cqlsh convenience.
+
+name: fsdemo
+
+networks:
+  scylla:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.0.0/24
+
+services:
+  scylla-node1:
+    image: scylladb/scylla:2026.1.5
+    container_name: fsdemo-node1
+    command: >
+      --seeds=172.31.0.11
+      --smp 6 --memory 10G
+      --overprovisioned 1
+      --developer-mode 1
+      --api-address 0.0.0.0
+    networks:
+      scylla:
+        ipv4_address: 172.31.0.11
+    ports:
+      - "9042:9042"   # cqlsh / convenience
+      - "9180:9180"   # prometheus metrics (for monitoring stack)
+    volumes:
+      - fsdemo-data1:/var/lib/scylla
+    restart: unless-stopped
+
+  scylla-node2:
+    image: scylladb/scylla:2026.1.5
+    container_name: fsdemo-node2
+    command: >
+      --seeds=172.31.0.11
+      --smp 6 --memory 10G
+      --overprovisioned 1
+      --developer-mode 1
+      --api-address 0.0.0.0
+    networks:
+      scylla:
+        ipv4_address: 172.31.0.12
+    volumes:
+      - fsdemo-data2:/var/lib/scylla
+    restart: unless-stopped
+    depends_on:
+      - scylla-node1
+
+  scylla-node3:
+    image: scylladb/scylla:2026.1.5
+    container_name: fsdemo-node3
+    command: >
+      --seeds=172.31.0.11
+      --smp 6 --memory 10G
+      --overprovisioned 1
+      --developer-mode 1
+      --api-address 0.0.0.0
+    networks:
+      scylla:
+        ipv4_address: 172.31.0.13
+    volumes:
+      - fsdemo-data3:/var/lib/scylla
+    restart: unless-stopped
+    depends_on:
+      - scylla-node1
+
+volumes:
+  fsdemo-data1:
+  fsdemo-data2:
+  fsdemo-data3:

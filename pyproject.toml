@@ -1,0 +1,15 @@
+[project]
+name = "fast-feature-store"
+version = "0.1.0"
+description = "Real-time feature store on ScyllaDB, fed by a Hyperliquid fills firehose"
+requires-python = ">=3.11"
+dependencies = [
+    "scylla-driver>=3.26",
+    "polars>=1.0",
+    "pyarrow>=15",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]

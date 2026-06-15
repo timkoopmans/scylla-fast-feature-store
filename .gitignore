@@ -1,0 +1,21 @@
+# Large dataset — staged separately (fetched into data/, published via object store)
+data/
+**/fills/
+*.parquet
+*.tar
+*.tar.gz
+*.tgz
+
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# demo run artifacts
+sample_keys.csv
+results/
+
+# rendered slides
+*.html
+*.pdf
+*.pptx

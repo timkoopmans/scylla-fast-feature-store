@@ -1,0 +1,383 @@
+"""Live web dashboard for the replay + feature store.
+
+Architecture matters here: the replay+ingest loop is a tight Python loop that
+holds the GIL almost continuously, so if the inference reads share its process
+they look artificially slow. We therefore run **ingest in a separate process**
+and do the inference point-reads in the web process, where the GIL is free — so
+the latency widget shows ScyllaDB's true sub-millisecond reads while the firehose
+hammers writes from the other process.
+
+  * ingest process : replay -> features -> upserts to ScyllaDB; paces itself from
+    a shared speed (so the BURST button can spike it live); publishes firehose
+    stats, the busiest coins (with volume), and the wallet-archetype mix.
+  * web process    : point-reads coin_window_features for those busy coins (the
+    inference retrieval path), scores them, records DB read latency + freshness,
+    and streams everything to an HTML page over a websocket.
+
+    uvicorn feature_store.dashboard:app --host 0.0.0.0 --port 8090
+    # then open http://<demo-host>:8090  (set FS_SPEED, FS_DAYS to taste)
+
+Complements ScyllaDB Monitoring: Grafana shows the DB internals; this shows the
+feature-store semantics — the firehose, fresh features, live inference, the
+read-tail-under-write-burst, and the per-coin load skew that motivates the
+partition-key design.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import datetime as dt
+import multiprocessing as mp
+import os
+import threading
+import time
+from collections import deque
+from datetime import timezone
+
+from fastapi import FastAPI, WebSocket
+from fastapi.responses import HTMLResponse
+
+from .config import make_cluster, KEYSPACE
+from .features import FeatureEngine
+from .replay import iter_fills
+from .scorer import unusual_accumulation
+from .statements import prepare_all
+from .writer import Pipeline
+
+UTC = timezone.utc
+SPEED = float(os.environ.get("FS_SPEED", "30"))
+DAYS = int(os.environ.get("FS_DAYS", "3"))
+PROFILE = os.environ.get("FS_PROFILE", "local")
+BURST_SECS = float(os.environ.get("FS_BURST_SECS", "8"))
+
+app = FastAPI(title="ScyllaDB feature store — live")
+
+_ASSETS = os.path.join(os.path.dirname(__file__), "..", "..", "assets")
+
+
+def _data_uri(name: str, mime: str) -> str:
+    try:
+        with open(os.path.join(_ASSETS, name), "rb") as fh:
+            return f"data:{mime};base64," + base64.b64encode(fh.read()).decode()
+    except OSError:
+        return ""
+
+
+_LOGO_SCYLLA = _data_uri("scylladb-monster.svg", "image/svg+xml")
+_LOGO_HL = _data_uri("hyperliquid-logo.png", "image/png")
+
+STATS = {
+    "fills_total": 0, "writes_total": 0, "fills_per_s": 0.0, "writes_per_s": 0.0,
+    "data_time": None, "scoreboard": [], "read_p99_ms": 0.0, "fresh_us": 0.0,
+    "active_coins": 0, "wallets": 0, "hot": [], "arch": {}, "bursting": False,
+}
+_lock = threading.Lock()
+_proc = {}
+
+
+def _ts(ms: int) -> dt.datetime:
+    return dt.datetime.fromtimestamp(ms / 1000.0, tz=UTC)
+
+
+# --------------------------------------------------------------------------- #
+# ingest process — self-paced so the BURST button can spike replay speed live
+# --------------------------------------------------------------------------- #
+def _ingest_proc(shared, base_speed, days, profile):
+    engine = FeatureEngine()
+    cluster = make_cluster(profile, "tuned")
+    session = cluster.connect(KEYSPACE)
+    ps = prepare_all(session)
+    pipe = Pipeline(session, max_inflight=2048)
+    now0 = time.monotonic()
+    last_t = last_flush = last_speedchk = now0
+    last_fills = last_writes = 0
+    n = 0
+    next_emit = now0
+    prev_ts = None
+    eff_speed = base_speed
+
+    def flush_open():
+        for coin, win, snap in engine.coins.open_snapshots():
+            pipe.execute(ps["coin_window"], (
+                coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
+                snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
+                snap["active_wallets"], snap["hhi"], snap["large_flow"]))
+
+    for f in iter_fills(limit_days=days):
+        now = time.monotonic()
+
+        # refresh effective speed / burst state every 0.25s (Manager reads are IPC)
+        if now - last_speedchk >= 0.25:
+            base = shared.get("speed", base_speed)
+            bursting = time.time() < shared.get("burst_until", 0.0)
+            eff_speed = 1e9 if bursting else base
+            last_speedchk = now
+            shared["bursting"] = bursting
+
+        # inter-arrival pacing (handles dynamic speed cleanly)
+        if prev_ts is not None and eff_speed > 0:
+            next_emit += (f.ts_ms - prev_ts) / 1000.0 / eff_speed
+            slp = next_emit - time.monotonic()
+            if slp > 0:
+                time.sleep(slp)
+            elif slp < -1.0:                 # fell behind; resync to now
+                next_emit = time.monotonic()
+        prev_ts = f.ts_ms
+
+        wc, w, closed = engine.apply(f)
+        pipe.execute(ps["wallet_coin"], (
+            f.addr, f.coin, wc.net_pos, wc.avg_entry, wc.realized_pnl,
+            wc.fill_count, _ts(wc.last_ts)))
+        for coin, win, snap in closed:
+            pipe.execute(ps["coin_window"], (
+                coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
+                snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
+                snap["active_wallets"], snap["hhi"], snap["large_flow"]))
+        n += 1
+
+        if now - last_flush >= 0.25:
+            flush_open()
+            last_flush = now
+        if now - last_t >= 0.5:
+            dt_s = now - last_t
+            hot = sorted(((b.volume, coin) for (coin, win), b in engine.coins.open.items()
+                          if win == "1m"), reverse=True)[:14]
+            arch = {"market-maker": 0, "directional": 0, "mixed": 0}
+            for ws in engine.wallets.values():
+                arch[ws.archetype] = arch.get(ws.archetype, 0) + 1
+            shared["fills_total"] = n
+            shared["writes_total"] = pipe.count
+            shared["fills_per_s"] = (n - last_fills) / dt_s
+            shared["writes_per_s"] = (pipe.count - last_writes) / dt_s
+            shared["data_time_ms"] = f.ts_ms
+            shared["wallets"] = len(engine.wallets)
+            shared["active_coins"] = len(engine.coins.open) // 3
+            shared["hot"] = [{"coin": c, "vol": v} for v, c in hot]
+            shared["arch"] = arch
+            last_fills, last_writes, last_t = n, pipe.count, now
+
+    flush_open()
+    pipe.drain(2048)
+    session.shutdown()
+    cluster.shutdown()
+
+
+# --------------------------------------------------------------------------- #
+# reader thread (web process) — the inference retrieval path
+# --------------------------------------------------------------------------- #
+def _reader_thread(shared):
+    cluster = make_cluster(PROFILE, "tuned")
+    session = cluster.connect(KEYSPACE)
+    ps = prepare_all(session)
+    lat = deque(maxlen=3000)
+    while _proc.get("on", True):
+        # Freshness probe: write a sentinel feature, immediately read it back, and
+        # time the write->visible round trip. This is the store's freshness floor —
+        # how long after a feature is computed it becomes readable. At LOCAL_ONE
+        # the write commits and is readable on that replica with no quorum wait, so
+        # this lands in the hundreds of microseconds.
+        ptok = int(time.time() * 1000)
+        tp = time.perf_counter()
+        session.execute(ps["wallet_coin"], ("__probe__", "__fresh__", 0.0, 0.0, 0.0,
+                                            ptok, _ts(ptok)))
+        session.execute(ps["read_wallet_coin"], ("__probe__", "__fresh__"))
+        fresh_us = (time.perf_counter() - tp) * 1e6
+
+        hot = list(shared.get("hot", []))
+        board = []
+        for h in hot:
+            coin = h["coin"]
+            rows = {}
+            for win in ("1m", "5m", "1h"):
+                t0 = time.perf_counter()
+                r = session.execute(ps["read_coin_window"], (coin, win)).one()
+                lat.append((time.perf_counter() - t0) * 1000.0)
+                rows[win] = dict(r._asdict()) if r else None
+            sc = unusual_accumulation(rows["1m"], rows["5m"], rows["1h"])
+            imb_raw = (rows["1m"] or {}).get("buy_sell_imbalance", 0.0)
+            board.append({"coin": coin, "score": sc["score"], "label": sc["label"],
+                          "imb": round(imb_raw, 4), "vol": h["vol"]})
+        board.sort(key=lambda x: x["score"], reverse=True)
+        s = sorted(lat)
+        with _lock:
+            STATS["scoreboard"] = board
+            STATS["hot"] = sorted(hot, key=lambda x: x["vol"], reverse=True)
+            STATS["fills_total"] = shared.get("fills_total", 0)
+            STATS["writes_total"] = shared.get("writes_total", 0)
+            STATS["fills_per_s"] = shared.get("fills_per_s", 0.0)
+            STATS["writes_per_s"] = shared.get("writes_per_s", 0.0)
+            STATS["wallets"] = shared.get("wallets", 0)
+            STATS["active_coins"] = shared.get("active_coins", 0)
+            STATS["arch"] = dict(shared.get("arch", {}))
+            STATS["bursting"] = bool(shared.get("bursting", False))
+            STATS["fresh_us"] = round(fresh_us, 1)
+            dm = shared.get("data_time_ms")
+            STATS["data_time"] = _ts(dm).isoformat() if dm else None
+            if s:
+                STATS["read_p99_ms"] = round(s[min(len(s) - 1, int(len(s) * 0.99))], 3)
+        time.sleep(0.3)
+    session.shutdown()
+    cluster.shutdown()
+
+
+@app.on_event("startup")
+def _startup():
+    ctx = mp.get_context("spawn")
+    mgr = ctx.Manager()
+    shared = mgr.dict()
+    shared["hot"] = []
+    shared["speed"] = SPEED
+    shared["burst_until"] = 0.0
+    p = ctx.Process(target=_ingest_proc, args=(shared, SPEED, DAYS, PROFILE), daemon=True)
+    p.start()
+    _proc.update(on=True, p=p, mgr=mgr, shared=shared)
+    time.sleep(1.5)
+    threading.Thread(target=_reader_thread, args=(shared,), daemon=True).start()
+
+
+@app.on_event("shutdown")
+def _shutdown():
+    _proc["on"] = False
+    if _proc.get("p"):
+        _proc["p"].terminate()
+
+
+@app.post("/burst")
+def burst(secs: float = BURST_SECS):
+    """Spike replay to max speed for `secs` — drives a write burst on demand."""
+    _proc["shared"]["burst_until"] = time.time() + secs
+    return {"bursting_for_s": secs}
+
+
+@app.get("/stats")
+def stats():
+    with _lock:
+        return dict(STATS)
+
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    return HTML.replace("__SCYLLA__", _LOGO_SCYLLA).replace("__HL__", _LOGO_HL)
+
+
+HTML = """
+<!doctype html><html><head><meta charset=utf-8>
+<title>ScyllaDB Feature Store — LIVE</title>
+<style>
+ body{background:#0c0f14;color:#dfe6f0;font:14px/1.4 -apple-system,Segoe UI,Roboto,monospace;margin:0;padding:24px}
+ h1{font-size:18px;font-weight:600;color:#7fd1ff;margin:0 0 16px}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1180px}
+ .card{background:#141a23;border:1px solid #233040;border-radius:10px;padding:16px}
+ .big{font-size:38px;font-weight:700;color:#fff}.unit{font-size:13px;color:#8aa}
+ .row{display:flex;justify-content:space-between;align-items:center;margin:5px 0}
+ .bar{height:13px;background:linear-gradient(90deg,#2bd47a,#7fd1ff);border-radius:3px}
+ .coin{width:104px;font-weight:600}.score{width:46px;text-align:right;color:#fff}
+ .hot{color:#ff6b6b}.warm{color:#ffd166}.norm{color:#8aa}
+ canvas{width:100%;display:block}
+ .lat{font-size:28px;font-weight:700;color:#2bd47a}
+ .sub{color:#8aa;font-size:12px}
+ .pill{display:inline-block;padding:2px 8px;border-radius:10px;background:#1d2733;color:#7fd1ff;font-size:12px}
+ button{background:#ff6b6b;color:#0c0f14;border:0;border-radius:8px;padding:9px 16px;font-weight:700;cursor:pointer;font-size:14px}
+ button:hover{filter:brightness(1.1)} .burston{box-shadow:0 0 14px #ff6b6b}
+ .legend{font-size:11px;color:#8aa}.gr{color:#2bd47a}.bl{color:#7fd1ff}
+ .imbwrap{display:flex;align-items:center;height:12px;margin:0 10px;flex:1}
+ .imbbar{height:12px}.sell{background:#ff6b6b;border-radius:3px 0 0 3px}.buy{background:#2bd47a;border-radius:0 3px 3px 0}
+ .archseg{height:18px;display:inline-block} .achip{font-size:11px;margin-right:10px}
+</style></head><body>
+<h1><img src="__SCYLLA__" height=36 style=vertical-align:middle>
+  Feature Store — live replay of the Hyperliquid
+  <img src="__HL__" height=28 style=vertical-align:middle> fills firehose
+  <button id=burst onclick=doBurst()>⚡ BURST</button>
+  <span class=pill id=burststate>steady</span></h1>
+<div class=grid>
+  <div class=card>
+    <div class=sub>FIREHOSE</div>
+    <div class=big id=fps>0<span class=unit> fills/s</span></div>
+    <canvas id=spark width=540 height=52></canvas>
+    <div class=row><span class=sub>writes/s</span><b id=wps>0</b></div>
+    <div class=row><span class=sub>fills total</span><b id=ftot>0</b></div>
+    <div class=row><span class=sub>active coins / wallets</span><b id=card>0</b></div>
+    <div class=row><span class=sub>data clock</span><span class=pill id=clock>—</span></div>
+  </div>
+  <div class=card>
+    <div class=sub>READ TAIL vs WRITE LOAD &nbsp;<span class=legend><span class=gr>■</span> read p99 (ms) &nbsp;<span class=bl>■</span> writes/s</span></div>
+    <canvas id=chart width=540 height=120></canvas>
+    <div class=lat id=p99>0.000<span class=unit> ms &nbsp;p99 point read</span></div>
+    <div class=row><span class=sub>feature freshness (write→read)</span><b id=fresh>—</b></div>
+    <div class=sub>point-reads stay fast while writes spike — hit BURST to prove it</div>
+  </div>
+  <div class=card>
+    <div class=sub>WRITE LOAD BY COIN — the skew that drives partition-key design</div>
+    <div id=hot></div>
+  </div>
+  <div class=card>
+    <div class=sub>UNUSUAL ACCUMULATION — scored live from fresh features (taker buy/sell imbalance)</div>
+    <div id=board></div>
+  </div>
+  <div class=card style=grid-column:1/3>
+    <div class=sub>WALLET ARCHETYPE MIX</div>
+    <div id=archbar style=margin:8px 0></div>
+    <div id=archlegend></div>
+  </div>
+</div>
+<script>
+const sH=[],pH=[],wH=[];
+const sp=document.getElementById('spark'),sc=sp.getContext('2d');
+const ch=document.getElementById('chart'),cc=ch.getContext('2d');
+function line(ctx,cv,arr,color,max){if(arr.length<2)return;ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;
+ arr.forEach((v,i)=>{const x=i/(arr.length-1)*cv.width,y=cv.height-(v/(max||1))*cv.height*0.92-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();}
+function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,'#7fd1ff',Math.max(...sH,1));}
+function drawChart(){cc.clearRect(0,0,ch.width,ch.height);
+ line(cc,ch,wH,'#7fd1ff',Math.max(...wH,1));      // writes/s
+ line(cc,ch,pH,'#2bd47a',Math.max(...pH,2));}      // read p99 (own scale)
+function cls(l){return l=='unusual-accumulation'?'hot':l=='elevated'?'warm':'norm'}
+function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
+function age(ms){return ms==null?'—':ms<1000?ms+'ms':(ms/1000).toFixed(1)+'s'}
+function doBurst(){fetch('/burst',{method:'POST'});}
+const COL={'market-maker':'#7fd1ff','directional':'#ff6b6b','mixed':'#ffd166'};
+const ws=new WebSocket('ws://'+location.host+'/ws');
+ws.onmessage=e=>{const s=JSON.parse(e.data);
+ fps.innerHTML=fmt(s.fills_per_s)+'<span class=unit> fills/s</span>';
+ wps.textContent=fmt(s.writes_per_s); ftot.textContent=s.fills_total.toLocaleString();
+ card.textContent=s.active_coins+' / '+s.wallets.toLocaleString();
+ clock.textContent=(s.data_time||'—').replace('T',' ').slice(0,19);
+ p99.innerHTML=s.read_p99_ms.toFixed(3)+'<span class=unit> ms &nbsp;p99 point read</span>';
+ fresh.textContent=s.fresh_us<1000?s.fresh_us.toFixed(0)+' µs':(s.fresh_us/1000).toFixed(2)+' ms';
+ burststate.textContent=s.bursting?'BURSTING':'steady';
+ document.getElementById('burst').className=s.bursting?'burston':'';
+ sH.push(s.fills_per_s); wH.push(s.writes_per_s); pH.push(s.read_p99_ms);
+ [sH,wH,pH].forEach(a=>{if(a.length>120)a.shift()}); drawSpark(); drawChart();
+ // hot-partition skew bars (by write volume)
+ const hmx=Math.max(...s.hot.map(h=>h.vol),1);
+ hot.innerHTML=s.hot.map(h=>`<div class=row><span class=coin>${h.coin}</span>`+
+  `<div style=flex:1;margin:0 10px><div class=bar style="width:${h.vol/hmx*100}%;background:linear-gradient(90deg,#ff6b6b,#ffd166)"></div></div>`+
+  `<span class=sub style=width:64px;text-align:right>${fmt(h.vol)}</span></div>`).join('');
+ // accumulation scoreboard + imbalance
+ const mx=Math.max(...s.scoreboard.map(b=>b.score),0.01);
+ board.innerHTML=s.scoreboard.map(b=>{const im=b.imb||0,L=im<0?(-im*50):0,R=im>0?(im*50):0;
+  return `<div class=row><span class="coin ${cls(b.label)}">${b.coin}</span>`+
+   `<div class=imbwrap><div style=flex:1;text-align:right><div class="imbbar sell" style="width:${L}%;margin-left:auto"></div></div>`+
+   `<div style=flex:1><div class="imbbar buy" style="width:${R}%"></div></div></div>`+
+   `<span class=score>${b.score.toFixed(2)}</span></div>`}).join('');
+ // archetype mix
+ const a=s.arch||{},tot=(a['market-maker']||0)+(a['directional']||0)+(a['mixed']||0)||1;
+ archbar.innerHTML=['market-maker','directional','mixed'].map(k=>
+  `<span class=archseg style="width:${(a[k]||0)/tot*100}%;background:${COL[k]}"></span>`).join('');
+ archlegend.innerHTML=['market-maker','directional','mixed'].map(k=>
+  `<span class=achip style=color:${COL[k]}>■ ${k}: ${(a[k]||0).toLocaleString()}</span>`).join('');
+};
+</script></body></html>
+"""
+
+
+@app.websocket("/ws")
+async def ws(socket: WebSocket):
+    await socket.accept()
+    try:
+        while True:
+            with _lock:
+                payload = dict(STATS)
+            await socket.send_json(payload)
+            await asyncio.sleep(0.25)
+    except Exception:
+        return
