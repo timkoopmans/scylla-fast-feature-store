@@ -113,3 +113,7 @@ Optional ScyllaDB Monitoring (Grafana): `scripts/monitoring.sh up`.
 The code is Cloud-portable. Set the `cloud` profile env (`FS_CLOUD_BUNDLE` for a
 connect bundle, or `FS_CLOUD_HOSTS`/`FS_CLOUD_USER`/`FS_CLOUD_PASS`) and pass
 `--profile cloud`. Re-run the benchmarks there to capture Cloud numbers.
+
+## License
+
+[Apache-2.0](LICENSE)
