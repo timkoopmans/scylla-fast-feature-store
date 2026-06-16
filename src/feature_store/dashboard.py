@@ -56,11 +56,12 @@ BURST_SECS = float(os.environ.get("FS_BURST_SECS", "8"))
 # Background write-load fleet: N processes re-upserting fills at max speed so the
 # dashboard shows ScyllaDB absorbing real write load (the single paced ingest is
 # GIL-bound at ~5k/s). 0 = off.
+# Baseline blasters run flat-out (steady writes/s). BURST blasters sit idle until
+# ⚡ BURST is pressed, then write full-speed for the burst window — so BURST *adds*
+# write load on top of the baseline (no throttling of anything).
 BLASTERS = int(os.environ.get("FS_BLASTERS", "0"))
+BURST_BLASTERS = int(os.environ.get("FS_BURST_BLASTERS", "0"))
 BLAST_INFLIGHT = int(os.environ.get("FS_BLAST_INFLIGHT", "2048"))
-# Blasters throttle to this aggregate baseline; ⚡ BURST unthrottles them to full
-# speed, so the writes/s widget spikes on demand while reads stay flat.
-BASELINE_WPS = float(os.environ.get("FS_BASELINE_WPS", "40000"))
 
 app = FastAPI(title="ScyllaDB feature store — live")
 
@@ -177,7 +178,7 @@ def _ingest_proc(shared, base_speed, days, profile):
 # --------------------------------------------------------------------------- #
 # write-blaster process — sustains real write load to ScyllaDB
 # --------------------------------------------------------------------------- #
-def _blaster_proc(wid, nblast, days, profile, max_inflight, shared):
+def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
     import polars as pl
     from .replay import COLUMNS, day_files
     # this worker's even share of fills (stride by index), loaded once
@@ -196,31 +197,35 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, shared):
     stmt = prepare_all(session)["wallet_coin"]
     pipe = Pipeline(session, max_inflight=max_inflight, sample_every=4096)
     key = f"bw_{wid}"
-    per_blaster = max(1.0, BASELINE_WPS / max(1, nblast))   # throttled rate / proc
     BATCH = 1024
     fc = 0
     last_pub = time.monotonic()
     last_chk = last_pub
     bursting = False
-    t_batch = time.monotonic()
     while True:                       # loop the data forever (idempotent upserts)
+        # burst-only blasters idle (no writes) until BURST is active — they ADD
+        # load on top of the baseline rather than throttling anything.
+        if burst_only and not bursting:
+            time.sleep(0.1)
+            now = time.monotonic()
+            if now - last_chk >= 0.25:
+                bursting = time.time() < shared.get("burst_until", 0.0)
+                last_chk = now
+            shared[key] = pipe.count
+            continue
         for addr, coin, net, px, cpnl, ts in rows:
             fc += 1
             pipe.execute(stmt, (addr, coin, net, px, cpnl, fc, ts))
             if fc % BATCH == 0:
                 now = time.monotonic()
-                if now - last_chk >= 0.25:        # refresh burst state + publish
+                if now - last_chk >= 0.25:
                     bursting = time.time() < shared.get("burst_until", 0.0)
                     last_chk = now
                 if now - last_pub >= 0.4:
                     shared[key] = pipe.count
                     last_pub = now
-                if not bursting:                  # throttle this batch to baseline
-                    want = BATCH / per_blaster
-                    spent = now - t_batch
-                    if spent < want:
-                        time.sleep(want - spent)
-                t_batch = time.monotonic()
+                if burst_only and not bursting:   # burst ended -> go idle
+                    break
 
 
 # --------------------------------------------------------------------------- #
@@ -302,10 +307,14 @@ def _startup():
     shared["burst_until"] = 0.0
     p = ctx.Process(target=_ingest_proc, args=(shared, SPEED, DAYS, PROFILE), daemon=True)
     p.start()
+    # baseline blasters (always full-speed) + burst-only blasters (idle until
+    # BURST). Even-split over the TOTAL so each gets a distinct share.
+    total_b = BLASTERS + BURST_BLASTERS
     blasters = []
-    for w in range(BLASTERS):
+    for w in range(total_b):
+        burst_only = w >= BLASTERS
         b = ctx.Process(target=_blaster_proc,
-                        args=(w, BLASTERS, DAYS, PROFILE, BLAST_INFLIGHT, shared),
+                        args=(w, total_b, DAYS, PROFILE, BLAST_INFLIGHT, burst_only, shared),
                         daemon=True)
         b.start()
         blasters.append(b)

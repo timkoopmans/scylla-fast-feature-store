@@ -103,7 +103,7 @@ sync:
 # launch the live dashboard on the remote host against ScyllaDB Cloud (detached).
 # assumes the repo + .venv + ~/.fs-cloud.env are already set up on the remote.
 # blasters: background write-load procs (24 is the sweet spot on a 48-vCPU box).
-cloud-dashboard blasters="24" speed="10" days="1":
+cloud-dashboard blasters="24" burst_blasters="16" speed="10" days="1":
     #!/usr/bin/env bash
     set -euo pipefail
     [ -n "{{ remote }}" ] || { echo "set FS_REMOTE=user@host first"; exit 1; }
@@ -112,16 +112,17 @@ cloud-dashboard blasters="24" speed="10" days="1":
       echo "(use 'just cloud-dashboard-restart' to change blasters/speed)"
     else
       ssh {{ remote }} "cd {{ rdir }} && source ~/.fs-cloud.env && \
-        FS_SPEED={{ speed }} FS_DAYS={{ days }} FS_BLASTERS={{ blasters }} PYTHONPATH=src \
+        FS_SPEED={{ speed }} FS_DAYS={{ days }} FS_BLASTERS={{ blasters }} \
+        FS_BURST_BLASTERS={{ burst_blasters }} PYTHONPATH=src \
         nohup .venv/bin/python -m uvicorn --app-dir src feature_store.dashboard:app \
         --host 0.0.0.0 --port 8090 >/tmp/fs-dashboard.log 2>&1 & sleep 1; echo launched"
-      echo "starting on {{ remote }}:8090"
+      echo "starting on {{ remote }}:8090 (baseline {{ blasters }} + {{ burst_blasters }} burst blasters)"
     fi
 
 # force a restart (kill + relaunch) — use to change blasters/speed/days
-cloud-dashboard-restart blasters="24" speed="10" days="1":
+cloud-dashboard-restart blasters="24" burst_blasters="16" speed="10" days="1":
     ssh {{ remote }} "fuser -k 8090/tcp 2>/dev/null; sleep 2; echo killed"
-    @just cloud-dashboard {{ blasters }} {{ speed }} {{ days }}
+    @just cloud-dashboard {{ blasters }} {{ burst_blasters }} {{ speed }} {{ days }}
 
 # stop the remote dashboard
 cloud-dashboard-stop:
@@ -139,6 +140,6 @@ tunnel port="8090":
 # ONE COMMAND for the demo: launch the cloud dashboard + open the tunnel.
 # Open http://localhost:8090 once it says tunnelling; Ctrl-C closes the tunnel
 # (use 'just cloud-dashboard-stop' to stop the remote dashboard afterwards).
-cloud-demo blasters="24": (cloud-dashboard blasters)
+cloud-demo blasters="24" burst_blasters="16": (cloud-dashboard blasters burst_blasters)
     @echo "waiting for dashboard + blasters to ramp ..." && sleep 6
     @just tunnel
