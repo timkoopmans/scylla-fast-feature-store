@@ -37,6 +37,10 @@ from datetime import timezone
 from fastapi import FastAPI, WebSocket
 from fastapi.responses import HTMLResponse
 
+# Cap polars threads — the ingest and the write-blaster procs read parquet; set
+# before polars is imported (via .features/.replay below).
+os.environ.setdefault("POLARS_MAX_THREADS", "2")
+
 from .config import make_cluster, KEYSPACE
 from .features import FeatureEngine
 from .replay import iter_fills
@@ -49,6 +53,11 @@ SPEED = float(os.environ.get("FS_SPEED", "30"))
 DAYS = int(os.environ.get("FS_DAYS", "3"))
 PROFILE = os.environ.get("FS_PROFILE", "local")
 BURST_SECS = float(os.environ.get("FS_BURST_SECS", "8"))
+# Background write-load fleet: N processes re-upserting fills at max speed so the
+# dashboard shows ScyllaDB absorbing real write load (the single paced ingest is
+# GIL-bound at ~5k/s). 0 = off.
+BLASTERS = int(os.environ.get("FS_BLASTERS", "0"))
+BLAST_INFLIGHT = int(os.environ.get("FS_BLAST_INFLIGHT", "2048"))
 
 app = FastAPI(title="ScyllaDB feature store — live")
 
@@ -163,6 +172,41 @@ def _ingest_proc(shared, base_speed, days, profile):
 
 
 # --------------------------------------------------------------------------- #
+# write-blaster process — sustains real write load to ScyllaDB
+# --------------------------------------------------------------------------- #
+def _blaster_proc(wid, nblast, days, profile, max_inflight, shared):
+    import polars as pl
+    from .replay import COLUMNS, day_files
+    # this worker's even share of fills (stride by index), loaded once
+    rows = []
+    gi = 0
+    for path in day_files(days):
+        df = pl.read_parquet(path, columns=COLUMNS)
+        for addr, coin, px, sz, side, t, cpnl, crossed in df.iter_rows():
+            if gi % nblast == wid:
+                net = sz if side == "B" else -sz
+                rows.append((addr, coin, net, px, (cpnl or 0.0),
+                             dt.datetime.fromtimestamp(t / 1000.0, tz=UTC)))
+            gi += 1
+    cluster = make_cluster(profile, "tuned")
+    session = cluster.connect(KEYSPACE)
+    stmt = prepare_all(session)["wallet_coin"]
+    pipe = Pipeline(session, max_inflight=max_inflight, sample_every=4096)
+    key = f"bw_{wid}"
+    fc = 0
+    last = time.monotonic()
+    while True:                       # loop the data forever (idempotent upserts)
+        for addr, coin, net, px, cpnl, ts in rows:
+            fc += 1
+            pipe.execute(stmt, (addr, coin, net, px, cpnl, fc, ts))
+            if (fc & 0x3FFF) == 0:    # publish count ~every 16k writes
+                now = time.monotonic()
+                if now - last >= 0.4:
+                    shared[key] = pipe.count
+                    last = now
+
+
+# --------------------------------------------------------------------------- #
 # reader thread (web process) — the inference retrieval path
 # --------------------------------------------------------------------------- #
 def _reader_thread(shared):
@@ -170,6 +214,8 @@ def _reader_thread(shared):
     session = cluster.connect(KEYSPACE)
     ps = prepare_all(session)
     lat = deque(maxlen=3000)
+    prev_w = None
+    prev_wt = 0.0
     while _proc.get("on", True):
         # Freshness probe: write a sentinel feature, immediately read it back, and
         # time the write->visible round trip. This is the store's freshness floor —
@@ -199,19 +245,26 @@ def _reader_thread(shared):
                           "imb": round(imb_raw, 4), "vol": h["vol"]})
         board.sort(key=lambda x: x["score"], reverse=True)
         s = sorted(lat)
+        # grand total writes = paced ingest + the blaster fleet; rate from delta
+        snap = dict(shared)
+        total_w = snap.get("writes_total", 0) + sum(
+            v for k, v in snap.items() if k.startswith("bw_"))
+        now_w = time.monotonic()
+        wps = (total_w - prev_w) / (now_w - prev_wt) if prev_w is not None else 0.0
+        prev_w, prev_wt = total_w, now_w
         with _lock:
             STATS["scoreboard"] = board
             STATS["hot"] = sorted(hot, key=lambda x: x["vol"], reverse=True)
-            STATS["fills_total"] = shared.get("fills_total", 0)
-            STATS["writes_total"] = shared.get("writes_total", 0)
-            STATS["fills_per_s"] = shared.get("fills_per_s", 0.0)
-            STATS["writes_per_s"] = shared.get("writes_per_s", 0.0)
-            STATS["wallets"] = shared.get("wallets", 0)
-            STATS["active_coins"] = shared.get("active_coins", 0)
-            STATS["arch"] = dict(shared.get("arch", {}))
-            STATS["bursting"] = bool(shared.get("bursting", False))
+            STATS["fills_total"] = snap.get("fills_total", 0)
+            STATS["writes_total"] = total_w
+            STATS["fills_per_s"] = snap.get("fills_per_s", 0.0)
+            STATS["writes_per_s"] = max(0.0, wps)
+            STATS["wallets"] = snap.get("wallets", 0)
+            STATS["active_coins"] = snap.get("active_coins", 0)
+            STATS["arch"] = dict(snap.get("arch", {}))
+            STATS["bursting"] = bool(snap.get("bursting", False))
             STATS["fresh_us"] = round(fresh_us, 1)
-            dm = shared.get("data_time_ms")
+            dm = snap.get("data_time_ms")
             STATS["data_time"] = _ts(dm).isoformat() if dm else None
             if s:
                 STATS["read_p99_ms"] = round(s[min(len(s) - 1, int(len(s) * 0.99))], 3)
@@ -230,7 +283,14 @@ def _startup():
     shared["burst_until"] = 0.0
     p = ctx.Process(target=_ingest_proc, args=(shared, SPEED, DAYS, PROFILE), daemon=True)
     p.start()
-    _proc.update(on=True, p=p, mgr=mgr, shared=shared)
+    blasters = []
+    for w in range(BLASTERS):
+        b = ctx.Process(target=_blaster_proc,
+                        args=(w, BLASTERS, DAYS, PROFILE, BLAST_INFLIGHT, shared),
+                        daemon=True)
+        b.start()
+        blasters.append(b)
+    _proc.update(on=True, p=p, blasters=blasters, mgr=mgr, shared=shared)
     time.sleep(1.5)
     threading.Thread(target=_reader_thread, args=(shared,), daemon=True).start()
 
@@ -238,6 +298,8 @@ def _startup():
 @app.on_event("shutdown")
 def _shutdown():
     _proc["on"] = False
+    for b in _proc.get("blasters", []):
+        b.terminate()
     if _proc.get("p"):
         _proc["p"].terminate()
 
