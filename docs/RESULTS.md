@@ -1,15 +1,44 @@
 # Measured results — Webinar 1 demo
 
-All numbers from a single reference host (24 cores / 183 GB) against a **3-node
-ScyllaDB 2026.1.5 cluster in Docker**, RF=3, `--smp 6 --memory 10G --overprovisioned 1
---developer-mode 1` per node. This is a *dev* cluster (developer-mode on,
-overprovisioned, three nodes sharing one host) — numbers are conservative vs a
-properly-sized ScyllaDB Cloud cluster. Re-run on Cloud once creds are wired.
-
 > Methodology note: a single Python process is GIL-bound and becomes the client
 > bottleneck. Benchmarks therefore drive load from **multiple processes** so we
 > measure ScyllaDB, not the client. Where latency looks like pure queue depth
-> (in-flight ÷ throughput), it is — flagged inline.
+> (in-flight ÷ throughput), it is — flagged inline. We report **p99** — the tail
+> is the SLA for online inference.
+
+## ScyllaDB Cloud (AWS us-east-1) — the real run
+
+Client: one EC2 box (48 vCPU, ARM, us-east-1) → **3-node ScyllaDB Cloud cluster**
+(`AWS_US_EAST_1`, RF=3, 15 shards/node = 45 shards). Same region as the client.
+Driver verified: **shard + token aware** (15 connections/node, one per shard),
+**ICS** on the point-read tables, **prepared statements**, **LOCAL_ONE**.
+
+| metric | result |
+|---|---|
+| point-read p99 | **2.17 ms** @ 48 concurrent (48 single-thread procs), 0 errors |
+| network floor (EC2→Cloud) | 1.28 ms p99 (so ~0.9 ms is the cluster) |
+| read throughput (1 client box) | ~22–29k reads/s — **client-bound**, not the cluster |
+| write throughput | **~100k writes/s** (44 procs), 8.6M writes, 0 errors |
+| write scaling | 24 procs → 75k/s · 44 procs → 100k/s (linear in loader procs) |
+
+**Headline:** sub-2.2 ms p99 point reads against a managed 3-node Cloud cluster
+in the same region, with the cluster contributing ~0.9 ms over the network floor.
+Both read and write throughput here are limited by the single Python loader box
+(GIL-bound, ~2–3k ops/s per process); the 45-shard cluster was not the
+bottleneck. The path to 1M+ ops/s is more loader boxes or a native driver
+(`latte`/`cassandra-stress`) — no synthetic data needed.
+
+> The bench's multi-*threaded* model (6 threads/proc) inflates the read tail over
+> a real network (one driver reactor per process serialises the threads): it read
+> ~29k/s but at p99 ~9 ms. **One thread per process** removes that and shows the
+> true 2.17 ms p99. Use `--threads 1 --procs 48` for clean Cloud latency.
+
+## Local dev cluster (Docker)
+
+The numbers below are from a single reference host (24 cores / 183 GB) against a
+**3-node ScyllaDB 2026.1.5 cluster in Docker**, RF=3, `--smp 6 --memory 10G
+--overprovisioned 1 --developer-mode 1` per node — a *dev* cluster, useful for
+the relative/before-after results and local iteration.
 
 ## Low-latency point reads (inference fast path) — *Objective 3*
 

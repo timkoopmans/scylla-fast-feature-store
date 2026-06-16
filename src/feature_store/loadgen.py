@@ -13,6 +13,14 @@ Parquet is read and materialised first; only the write loop is timed.
 """
 from __future__ import annotations
 
+import os
+
+# Cap polars' threadpool BEFORE it is imported. Each loadgen worker only reads a
+# subset of one parquet file, so it doesn't need a 48-thread (per-core) pool; with
+# dozens of worker processes that would spawn thousands of idle threads (~139 per
+# worker) and oversubscribe the box. Honour an explicit override if set.
+os.environ.setdefault("POLARS_MAX_THREADS", "2")
+
 import argparse
 import datetime as dt
 import multiprocessing as mp

@@ -31,14 +31,22 @@ Inference demo: a scorer that flags a coin for **"unusual accumulation"** (and
 tags a wallet's archetype) by point-reading that entity's fresh features from
 ScyllaDB. The feature fetch is the fast path.
 
-## Measured headlines (3-node dev cluster — see `docs/RESULTS.md`)
+## Measured headlines (see `docs/RESULTS.md`)
+
+**ScyllaDB Cloud** (3-node, AWS us-east-1; EC2 client same region; shard/token-aware, ICS, prepared, LOCAL_ONE):
+
+| | result |
+|---|---|
+| point-read latency | **p99 2.17 ms** @ 48 concurrent (network floor 1.28 ms) |
+| write throughput | **~100k writes/s**, 0 errors (44-proc loadgen, loader-bound) |
+
+**Local dev cluster** (3-node Docker):
 
 | | result |
 |---|---|
 | point-read latency | **p99 1.6 ms** @ 29k reads/s (scales to 61k/s) |
 | write throughput | **108k writes/s** sustained, 0 errors (12-proc loadgen) |
-| feature-pipeline rate | ~17k fills/s single Python process (freshness rate) |
-| freshness | feature row reflects the active window; last write within it |
+| freshness (write→read) | **~0.9 ms** (LOCAL_ONE, no quorum wait) |
 
 ## Layout
 
