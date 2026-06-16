@@ -45,19 +45,23 @@ SIMPLE_WRITE = (
 
 
 def _worker(wid, procs, files, max_inflight, tuning, profile, mode, barrier, out_q):
-    # Load this shard's fills into memory (untimed).
+    # Load this worker's share of fills into memory (untimed). Split by row index
+    # (every procs-th row) so each worker gets an EQUAL count and they finish the
+    # timed write loop together — no taper. (This is a write-throughput test, so
+    # which worker writes which key doesn't matter; upserts are idempotent.)
     rows = []
     sample_keys = []
+    gi = 0
     for path in files:
         df = pl.read_parquet(path, columns=COLUMNS)
         for addr, coin, px, sz, side, t, cpnl, crossed in df.iter_rows():
-            if (hash(addr) % procs) != wid:
-                continue
-            net = sz if side == "B" else -sz
-            rows.append((addr, coin, net, px, (cpnl or 0.0),
-                         dt.datetime.fromtimestamp(t / 1000.0, tz=UTC)))
-            if len(sample_keys) < 2000 and (len(rows) % 53 == 0):
-                sample_keys.append((addr, coin))
+            if gi % procs == wid:
+                net = sz if side == "B" else -sz
+                rows.append((addr, coin, net, px, (cpnl or 0.0),
+                             dt.datetime.fromtimestamp(t / 1000.0, tz=UTC)))
+                if len(sample_keys) < 2000 and (len(rows) % 53 == 0):
+                    sample_keys.append((addr, coin))
+            gi += 1
 
     cluster = make_cluster(profile, tuning)
     session = cluster.connect(KEYSPACE)
