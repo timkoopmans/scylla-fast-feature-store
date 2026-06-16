@@ -454,7 +454,12 @@ HTML = """
        --dim:#3f3f46;--up:#26a69a;--dn:#ef5350}
  *{box-sizing:border-box}
  body{background:var(--bg);color:var(--fg);font:13px/1.45 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;margin:0;padding:22px;font-variant-numeric:tabular-nums}
- h1{font-size:16px;font-weight:600;letter-spacing:.2px;margin:0 0 16px;display:flex;align-items:center;gap:10px}
+ header{display:flex;justify-content:space-between;align-items:center;margin:0 0 18px;max-width:1180px}
+ .brand{display:flex;align-items:center;gap:12px}
+ .brand img{display:block}
+ .title{font-size:16px;font-weight:600;letter-spacing:.2px}
+ .title b{color:var(--mut);font-weight:600}
+ .ctl{display:flex;align-items:center;gap:10px}
  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;max-width:1180px}
  .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px}
  .big{font-size:34px;font-weight:700;color:var(--fg)}.unit{font-size:12px;color:--mut;color:var(--mut)}
@@ -478,11 +483,17 @@ HTML = """
  .flat{background:transparent;color:var(--mut);border:1px solid var(--bd)}
  .seg{height:18px;display:inline-block}.achip{font-size:11px;margin-right:14px}
 </style></head><body>
-<h1><img src="__SCYLLA__" height=30 style=vertical-align:middle>
-  Feature Store — live replay of the Hyperliquid
-  <img src="__HL__" height=24 style=vertical-align:middle> fills firehose
-  <button id=burst onclick=doBurst()>⚡ BURST</button>
-  <span class=pill id=burststate>steady</span></h1>
+<header>
+  <div class=brand>
+    <img src="__SCYLLA__" height=28>
+    <img src="__HL__" height=22 style=opacity:.85>
+    <span class=title>Feature Store <b>— live Hyperliquid fills firehose</b></span>
+  </div>
+  <div class=ctl>
+    <button id=burst onclick=doBurst()>⚡ BURST</button>
+    <span class=pill id=burststate>steady</span>
+  </div>
+</header>
 <div class=grid>
   <div class=card>
     <div class=sub>Firehose</div>
