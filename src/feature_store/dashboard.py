@@ -107,6 +107,10 @@ def _ts(ms: int) -> dt.datetime:
 # ingest process — self-paced so the BURST button can spike replay speed live
 # --------------------------------------------------------------------------- #
 def _ingest_proc(shared, base_speed, days, profile):
+    import collections
+    diag = {"wc": 0, "cw": 0}            # write-attribution counters
+    wc_keys = collections.Counter()      # wallet_coin partitions (addr)
+    cw_keys = collections.Counter()      # coin_window partitions (coin)
     engine = FeatureEngine()
     cluster = make_cluster(profile, "tuned")
     session = cluster.connect(KEYSPACE)
@@ -128,6 +132,8 @@ def _ingest_proc(shared, base_speed, days, profile):
 
     def flush_open():
         for coin, win, snap in engine.open_snapshots():
+            diag["cw"] += 1
+            cw_keys[coin] += 1
             pipe.execute(
                 ps["coin_window"],
                 (
@@ -167,6 +173,8 @@ def _ingest_proc(shared, base_speed, days, profile):
         prev_ts = f.ts_ms
 
         wc, w, closed = engine.apply(f)
+        diag["wc"] += 1
+        wc_keys[f.addr] += 1
         pipe.execute(
             ps["wallet_coin"],
             (
@@ -180,6 +188,8 @@ def _ingest_proc(shared, base_speed, days, profile):
             ),
         )
         for coin, win, snap in closed:
+            diag["cw"] += 1
+            cw_keys[coin] += 1
             pipe.execute(
                 ps["coin_window"],
                 (
@@ -223,6 +233,14 @@ def _ingest_proc(shared, base_speed, days, profile):
             shared["active_coins"] = len(engine.coins.open) // 3
             shared["hot"] = [{"coin": c, "vol": v} for v, c in hot]
             shared["arch"] = arch
+            # write attribution (diagnostic): table mix + top partitions
+            tw = diag["wc"] + diag["cw"]
+            shared["wmix"] = {
+                "wallet_coin": diag["wc"], "coin_window": diag["cw"],
+                "cw_pct": round(100 * diag["cw"] / tw, 1) if tw else 0,
+                "wc_top": wc_keys.most_common(3),
+                "cw_top": cw_keys.most_common(3),
+            }
             last_fills, last_writes, last_t = n, pipe.count, now
 
     flush_open()
@@ -379,6 +397,7 @@ def _reader_thread(shared):
             STATS["active_coins"] = snap.get("active_coins", 0)
             STATS["arch"] = dict(snap.get("arch", {}))
             STATS["bursting"] = bool(snap.get("bursting", False))
+            STATS["wmix"] = snap.get("wmix", {})
             STATS["fresh_us"] = round(fresh_us, 1)
             dm = snap.get("data_time_ms")
             STATS["data_time"] = _ts(dm).isoformat() if dm else None
