@@ -505,7 +505,7 @@ HTML = """
     <div class=row><span class=sub>data clock</span><span class=pill id=clock>—</span></div>
   </div>
   <div class=card>
-    <div class=sub>Read tail vs write load &nbsp;<span class=legend><b style=color:#a78bfa>● read p99 (ms)</b> &nbsp;<b style=color:#6ea8fe>● writes/s</b></span></div>
+    <div class=sub>Read tail vs write load &nbsp;<span class=legend><b style=color:#2bd6c6>● read p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● writes/s</b></span></div>
     <canvas id=chart width=540 height=120></canvas>
     <div class=lat id=p99>0.000<span class=unit> ms &nbsp;p99 point read</span></div>
     <div class=row><span class=sub>feature freshness (write→read)</span><b id=fresh>—</b></div>
@@ -530,13 +530,13 @@ HTML = """
 const sH=[],pH=[],wH=[];
 const sp=document.getElementById('spark'),sc=sp.getContext('2d');
 const ch=document.getElementById('chart'),cc=ch.getContext('2d');
-const FG='#e4e4e7',MUT='#71717a',BLUE='#6ea8fe',PUR='#a78bfa';
+const FG='#e4e4e7',MUT='#71717a',TEAL='#2bd6c6';
 function line(ctx,cv,arr,color,max,dash){if(arr.length<2)return;ctx.setLineDash(dash||[]);ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.8;
  arr.forEach((v,i)=>{const x=i/(arr.length-1)*cv.width,y=cv.height-(v/(max||1))*cv.height*0.92-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.setLineDash([]);}
-function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,BLUE,Math.max(...sH,1));}
+function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,FG,Math.max(...sH,1));}
 function drawChart(){cc.clearRect(0,0,ch.width,ch.height);
- line(cc,ch,wH,BLUE,Math.max(...wH,1));    // writes/s (azure)
- line(cc,ch,pH,PUR,Math.max(...pH,2));}     // read p99 (violet, own scale)
+ line(cc,ch,wH,FG,Math.max(...wH,1));       // writes/s (white)
+ line(cc,ch,pH,TEAL,Math.max(...pH,2));}     // read p99 (ScyllaDB teal, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
 function doBurst(){fetch('/burst',{method:'POST'});}
 const COL={'directional':'#e4e4e7','mixed':'#71717a','market-maker':'#3f3f46'};
