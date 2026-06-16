@@ -10,6 +10,9 @@
 
 py := ".venv/bin/python"
 host := env_var_or_default("FS_HOST", "localhost")
+# remote demo host for the cloud dashboard/tunnel recipes, e.g. FS_REMOTE=ubuntu@1.2.3.4
+remote := env_var_or_default("FS_REMOTE", "")
+rdir := env_var_or_default("FS_REMOTE_DIR", "scylla-fast-feature-store")
 
 export PYTHONPATH := "src"
 
@@ -95,3 +98,28 @@ demo:
 # rsync this repo to $FS_HOST (set FS_HOST first)
 sync:
     FS_HOST={{host}} scripts/sync.sh
+
+# --- remote demo control (run from your laptop; set FS_REMOTE=user@host) ---
+# launch the live dashboard on the remote host against ScyllaDB Cloud (detached).
+# assumes the repo + .venv + ~/.fs-cloud.env are already set up on the remote.
+# blasters: background write-load procs (24 is the sweet spot on a 48-vCPU box).
+cloud-dashboard blasters="24" speed="10" days="1":
+    @test -n "{{remote}}" || (echo "set FS_REMOTE=user@host first" && exit 1)
+    ssh {{remote}} "cd {{rdir}} && source ~/.fs-cloud.env && fuser -k 8090/tcp 2>/dev/null; sleep 2; \
+        FS_SPEED={{speed}} FS_DAYS={{days}} FS_BLASTERS={{blasters}} PYTHONPATH=src \
+        nohup .venv/bin/python -m uvicorn --app-dir src feature_store.dashboard:app \
+        --host 0.0.0.0 --port 8090 >/tmp/fs-dashboard.log 2>&1 & sleep 1; echo launched"
+    @echo "starting on {{remote}}:8090 — now run 'just tunnel', then open http://localhost:8090"
+
+# stop the remote dashboard
+cloud-dashboard-stop:
+    ssh {{remote}} "fuser -k 8090/tcp 2>/dev/null || true; echo stopped"
+
+# tail the remote dashboard log
+cloud-dashboard-log:
+    ssh {{remote}} "tail -n 40 /tmp/fs-dashboard.log"
+
+# open an SSH tunnel from this laptop to the remote dashboard (Ctrl-C to close)
+tunnel port="8090":
+    @echo "tunnel localhost:{{port}} -> {{remote}}:8090  |  open http://localhost:{{port}}"
+    ssh -N -L {{port}}:localhost:8090 {{remote}}
