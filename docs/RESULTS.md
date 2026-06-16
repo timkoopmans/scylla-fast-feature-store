@@ -18,16 +18,31 @@ Driver verified: **shard + token aware** (15 connections/node, one per shard),
 | point-read p99 | **2.17 ms** @ 48 concurrent (48 single-thread procs), 0 errors |
 | network floor (EC2→Cloud) | 1.28 ms p99 (so ~0.9 ms is the cluster) |
 | read throughput (1 client box) | ~22–29k reads/s — **client-bound**, not the cluster |
-| write throughput | **~100k writes/s** (44 procs), 8.6M writes, 0 errors |
-| write scaling | 24 procs → 75k/s · 44 procs → 100k/s (linear in loader procs) |
+| write throughput | **~230k writes/s** (88 procs), 8.38M writes, 0 errors |
+| write scaling | 44 procs → 217k/s · 64 → 221k · 88 → 230k (all-Python, one box) |
 
-**Headline:** sub-2.2 ms p99 point reads against a managed 3-node Cloud cluster
-in the same region, with the cluster contributing ~0.9 ms over the network floor.
-Both read and write throughput here are limited by the single Python loader box
-(GIL-bound, ~2–3k ops/s per process); the 45-shard cluster was not the
-bottleneck. The path to 1M+ ops/s is more loader boxes or a native driver
-(`latte`/`cassandra-stress`) — no synthetic data needed.
+**Headline:** sub-2.2 ms p99 point reads, and **~230k writes/s in pure Python
+from a single box** (0 errors), against a managed 3-node Cloud cluster in the same
+region. Still loader-bound — the 45-shard cluster was not the bottleneck. The path
+beyond is more loader boxes or a native driver (`latte`/Rust); no synthetic data
+needed.
 
+### Pushing pure Python (what actually moved the write number)
+- **Even per-worker split removes the finish "taper."** Sharding by `hash(addr)`
+  gives whale wallets far more rows, so a few workers run long while the rest sit
+  idle — `total ÷ max-window` then *understates* the peak (~100k). Splitting rows
+  evenly (stride by index) makes workers finish together → true peak **~217–230k/s**.
+- **Oversubscribe processes.** Writes are network-bound, so >cores helps a little:
+  44 → 217k, 88 → 230k on a 48-vCPU box.
+- **`execute_concurrent_with_args` was *slower*** (74k vs 94k at 44 procs, pre-fix):
+  it returns results *in submission order*, so draining the generator suffers
+  head-of-line blocking. Our **unordered** `Pipeline` (fire + release on whatever
+  finishes first) is the better high-throughput path. The "recommended" helper
+  optimises for ordered results, not raw throughput.
+- The driver's **Cython** extensions are already compiled (`.so`) — the native
+  fast path is on; the residual limit is the GIL on Python glue (→ multiprocessing).
+
+### Read-latency methodology
 > The bench's multi-*threaded* model (6 threads/proc) inflates the read tail over
 > a real network (one driver reactor per process serialises the threads): it read
 > ~29k/s but at p99 ~9 ms. **One thread per process** removes that and shows the

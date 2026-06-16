@@ -38,7 +38,7 @@ ScyllaDB. The feature fetch is the fast path.
 | | result |
 |---|---|
 | point-read latency | **p99 2.17 ms** @ 48 concurrent (network floor 1.28 ms) |
-| write throughput | **~100k writes/s**, 0 errors (44-proc loadgen, loader-bound) |
+| write throughput | **~230k writes/s** pure Python, 0 errors (88-proc loadgen, loader-bound) |
 
 **Local dev cluster** (3-node Docker):
 
