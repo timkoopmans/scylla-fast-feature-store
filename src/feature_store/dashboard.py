@@ -22,6 +22,7 @@ feature-store semantics — the firehose, fresh features, live inference, the
 read-tail-under-write-burst, and the per-coin load skew that motivates the
 partition-key design.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -41,7 +42,7 @@ from fastapi.responses import HTMLResponse
 # before polars is imported (via .features/.replay below).
 os.environ.setdefault("POLARS_MAX_THREADS", "2")
 
-from .config import make_cluster, KEYSPACE
+from .config import KEYSPACE, make_cluster
 from .features import FeatureEngine
 from .replay import iter_fills
 from .scorer import unusual_accumulation
@@ -80,9 +81,19 @@ _LOGO_SCYLLA = _data_uri("scylladb-monster.svg", "image/svg+xml")
 _LOGO_HL = _data_uri("hyperliquid-logo.png", "image/png")
 
 STATS = {
-    "fills_total": 0, "writes_total": 0, "fills_per_s": 0.0, "writes_per_s": 0.0,
-    "data_time": None, "scoreboard": [], "read_p99_ms": 0.0, "fresh_us": 0.0,
-    "active_coins": 0, "wallets": 0, "hot": [], "arch": {}, "bursting": False,
+    "fills_total": 0,
+    "writes_total": 0,
+    "fills_per_s": 0.0,
+    "writes_per_s": 0.0,
+    "data_time": None,
+    "scoreboard": [],
+    "read_p99_ms": 0.0,
+    "fresh_us": 0.0,
+    "active_coins": 0,
+    "wallets": 0,
+    "hot": [],
+    "arch": {},
+    "bursting": False,
 }
 _lock = threading.Lock()
 _proc = {}
@@ -117,10 +128,22 @@ def _ingest_proc(shared, base_speed, days, profile):
 
     def flush_open():
         for coin, win, snap in engine.open_snapshots():
-            pipe.execute(ps["coin_window"], (
-                coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
-                snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
-                snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"]))
+            pipe.execute(
+                ps["coin_window"],
+                (
+                    coin,
+                    win,
+                    _ts(snap["bucket_ts"] * 1000),
+                    snap["volume"],
+                    snap["taker_buy"],
+                    snap["taker_sell"],
+                    snap["buy_sell_imbalance"],
+                    snap["active_wallets"],
+                    snap["hhi"],
+                    snap["large_flow"],
+                    snap["smart_flow"],
+                ),
+            )
 
     for f in iter_fills(limit_days=days):
         now = time.monotonic()
@@ -139,19 +162,40 @@ def _ingest_proc(shared, base_speed, days, profile):
             slp = next_emit - time.monotonic()
             if slp > 0:
                 time.sleep(slp)
-            elif slp < -1.0:                 # fell behind; resync to now
+            elif slp < -1.0:  # fell behind; resync to now
                 next_emit = time.monotonic()
         prev_ts = f.ts_ms
 
         wc, w, closed = engine.apply(f)
-        pipe.execute(ps["wallet_coin"], (
-            f.addr, f.coin, wc.net_pos, wc.avg_entry, wc.realized_pnl,
-            wc.fill_count, _ts(wc.last_ts)))
+        pipe.execute(
+            ps["wallet_coin"],
+            (
+                f.addr,
+                f.coin,
+                wc.net_pos,
+                wc.avg_entry,
+                wc.realized_pnl,
+                wc.fill_count,
+                _ts(wc.last_ts),
+            ),
+        )
         for coin, win, snap in closed:
-            pipe.execute(ps["coin_window"], (
-                coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
-                snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
-                snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"]))
+            pipe.execute(
+                ps["coin_window"],
+                (
+                    coin,
+                    win,
+                    _ts(snap["bucket_ts"] * 1000),
+                    snap["volume"],
+                    snap["taker_buy"],
+                    snap["taker_sell"],
+                    snap["buy_sell_imbalance"],
+                    snap["active_wallets"],
+                    snap["hhi"],
+                    snap["large_flow"],
+                    snap["smart_flow"],
+                ),
+            )
         n += 1
 
         if now - last_flush >= 0.25:
@@ -159,8 +203,14 @@ def _ingest_proc(shared, base_speed, days, profile):
             last_flush = now
         if now - last_t >= 0.5:
             dt_s = now - last_t
-            hot = sorted(((b.volume, coin) for (coin, win), b in engine.coins.open.items()
-                          if win == "1m"), reverse=True)[:14]
+            hot = sorted(
+                (
+                    (b.volume, coin)
+                    for (coin, win), b in engine.coins.open.items()
+                    if win == "1m"
+                ),
+                reverse=True,
+            )[:14]
             arch = {"market-maker": 0, "directional": 0, "mixed": 0}
             for ws in engine.wallets.values():
                 arch[ws.archetype] = arch.get(ws.archetype, 0) + 1
@@ -186,7 +236,9 @@ def _ingest_proc(shared, base_speed, days, profile):
 # --------------------------------------------------------------------------- #
 def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
     import polars as pl
+
     from .replay import COLUMNS, day_files
+
     # this worker's even share of fills (stride by index), loaded once
     rows = []
     gi = 0
@@ -195,8 +247,16 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
         for addr, coin, px, sz, side, t, cpnl, crossed in df.iter_rows():
             if gi % nblast == wid:
                 net = sz if side == "B" else -sz
-                rows.append((addr, coin, net, px, (cpnl or 0.0),
-                             dt.datetime.fromtimestamp(t / 1000.0, tz=UTC)))
+                rows.append(
+                    (
+                        addr,
+                        coin,
+                        net,
+                        px,
+                        (cpnl or 0.0),
+                        dt.datetime.fromtimestamp(t / 1000.0, tz=UTC),
+                    )
+                )
             gi += 1
     cluster = make_cluster(profile, "tuned")
     session = cluster.connect(KEYSPACE)
@@ -208,7 +268,7 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
     last_pub = time.monotonic()
     last_chk = last_pub
     bursting = False
-    while True:                       # loop the data forever (idempotent upserts)
+    while True:  # loop the data forever (idempotent upserts)
         # burst-only blasters idle (no writes) until BURST is active — they ADD
         # load on top of the baseline rather than throttling anything.
         if burst_only and not bursting:
@@ -230,7 +290,7 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
                 if now - last_pub >= 0.4:
                     shared[key] = pipe.count
                     last_pub = now
-                if burst_only and not bursting:   # burst ended -> go idle
+                if burst_only and not bursting:  # burst ended -> go idle
                     break
 
 
@@ -242,7 +302,7 @@ def _reader_thread(shared):
     session = cluster.connect(KEYSPACE)
     ps = prepare_all(session)
     lat = deque(maxlen=3000)
-    whist = deque()   # (t, total_writes) over a sliding window, for a smooth rate
+    whist = deque()  # (t, total_writes) over a sliding window, for a smooth rate
     while _proc.get("on", True):
         # Freshness probe: write a sentinel feature, immediately read it back, and
         # time the write->visible round trip. This is the store's freshness floor —
@@ -251,8 +311,10 @@ def _reader_thread(shared):
         # this lands in the hundreds of microseconds.
         ptok = int(time.time() * 1000)
         tp = time.perf_counter()
-        session.execute(ps["wallet_coin"], ("__probe__", "__fresh__", 0.0, 0.0, 0.0,
-                                            ptok, _ts(ptok)))
+        session.execute(
+            ps["wallet_coin"],
+            ("__probe__", "__fresh__", 0.0, 0.0, 0.0, ptok, _ts(ptok)),
+        )
         session.execute(ps["read_wallet_coin"], ("__probe__", "__fresh__"))
         fresh_us = (time.perf_counter() - tp) * 1e6
 
@@ -271,7 +333,7 @@ def _reader_thread(shared):
             b5 = rows["5m"] or {}
             smart = b5.get("smart_flow", 0.0) or 0.0
             vol5 = (b5.get("volume", 0.0) or 0.0) or 1e-9
-            smart_norm = max(-1.0, min(1.0, smart / vol5))   # -1..1 for the bar
+            smart_norm = max(-1.0, min(1.0, smart / vol5))  # -1..1 for the bar
             # signal = accumulation + smart-money agreeing on direction
             if sc["score"] >= 0.5 and smart_norm > 0.05:
                 action = "LONG"
@@ -279,22 +341,33 @@ def _reader_thread(shared):
                 action = "SHORT"
             else:
                 action = "—"
-            board.append({"coin": coin, "score": sc["score"], "label": sc["label"],
-                          "smart": round(smart_norm, 4), "action": action,
-                          "vol": h["vol"]})
+            board.append(
+                {
+                    "coin": coin,
+                    "score": sc["score"],
+                    "label": sc["label"],
+                    "smart": round(smart_norm, 4),
+                    "action": action,
+                    "vol": h["vol"],
+                }
+            )
         # rank by conviction: |smart-money flow| then score
         board.sort(key=lambda x: (abs(x["smart"]), x["score"]), reverse=True)
         s = sorted(lat)
         # grand total writes = paced ingest + the blaster fleet; rate from delta
         snap = dict(shared)
         total_w = snap.get("writes_total", 0) + sum(
-            v for k, v in snap.items() if k.startswith("bw_"))
+            v for k, v in snap.items() if k.startswith("bw_")
+        )
         now_w = time.monotonic()
         whist.append((now_w, total_w))
-        while len(whist) > 1 and now_w - whist[0][0] > 2.5:   # ~2.5s window
+        while len(whist) > 1 and now_w - whist[0][0] > 2.5:  # ~2.5s window
             whist.popleft()
-        wps = ((whist[-1][1] - whist[0][1]) / (whist[-1][0] - whist[0][0])
-               if len(whist) > 1 and whist[-1][0] > whist[0][0] else 0.0)
+        wps = (
+            (whist[-1][1] - whist[0][1]) / (whist[-1][0] - whist[0][0])
+            if len(whist) > 1 and whist[-1][0] > whist[0][0]
+            else 0.0
+        )
         with _lock:
             STATS["scoreboard"] = board
             STATS["hot"] = sorted(hot, key=lambda x: x["vol"], reverse=True)
@@ -324,7 +397,9 @@ def _startup():
     shared["hot"] = []
     shared["speed"] = SPEED
     shared["burst_until"] = 0.0
-    p = ctx.Process(target=_ingest_proc, args=(shared, SPEED, DAYS, PROFILE), daemon=True)
+    p = ctx.Process(
+        target=_ingest_proc, args=(shared, SPEED, DAYS, PROFILE), daemon=True
+    )
     p.start()
     # baseline blasters (always full-speed) + burst-only blasters (idle until
     # BURST). Even-split over the TOTAL so each gets a distinct share.
@@ -332,9 +407,11 @@ def _startup():
     blasters = []
     for w in range(total_b):
         burst_only = w >= BLASTERS
-        b = ctx.Process(target=_blaster_proc,
-                        args=(w, total_b, DAYS, PROFILE, BLAST_INFLIGHT, burst_only, shared),
-                        daemon=True)
+        b = ctx.Process(
+            target=_blaster_proc,
+            args=(w, total_b, DAYS, PROFILE, BLAST_INFLIGHT, burst_only, shared),
+            daemon=True,
+        )
         b.start()
         blasters.append(b)
     _proc.update(on=True, p=p, blasters=blasters, mgr=mgr, shared=shared)
@@ -396,7 +473,7 @@ HTML = """
  .fhalf{flex:1;display:flex;height:12px}.fbar{height:12px}
  .sell{background:var(--dn);border-radius:3px 0 0 3px;margin-left:auto}
  .buy{background:var(--up);border-radius:0 3px 3px 0}
- .chip{width:52px;text-align:center;font-size:11px;font-weight:700;border-radius:5px;padding:2px 0}
+ .chip{width:52px;text-align:center;font-size:11px;font-weight:700;border-radius:5px;padding:2px 0;margin-left:12px}
  .long{background:var(--up);color:var(--bg)}.short{background:var(--dn);color:var(--bg)}
  .flat{background:transparent;color:var(--mut);border:1px solid var(--bd)}
  .seg{height:18px;display:inline-block}.achip{font-size:11px;margin-right:14px}
@@ -417,7 +494,7 @@ HTML = """
     <div class=row><span class=sub>data clock</span><span class=pill id=clock>—</span></div>
   </div>
   <div class=card>
-    <div class=sub>Read tail vs write load &nbsp;<span class=legend>— read p99 (ms) &nbsp;·· writes/s</span></div>
+    <div class=sub>Read tail vs write load &nbsp;<span class=legend><b style=color:#a78bfa>● read p99 (ms)</b> &nbsp;<b style=color:#6ea8fe>● writes/s</b></span></div>
     <canvas id=chart width=540 height=120></canvas>
     <div class=lat id=p99>0.000<span class=unit> ms &nbsp;p99 point read</span></div>
     <div class=row><span class=sub>feature freshness (write→read)</span><b id=fresh>—</b></div>
@@ -442,13 +519,13 @@ HTML = """
 const sH=[],pH=[],wH=[];
 const sp=document.getElementById('spark'),sc=sp.getContext('2d');
 const ch=document.getElementById('chart'),cc=ch.getContext('2d');
-const FG='#e4e4e7',MUT='#71717a';
+const FG='#e4e4e7',MUT='#71717a',BLUE='#6ea8fe',PUR='#a78bfa';
 function line(ctx,cv,arr,color,max,dash){if(arr.length<2)return;ctx.setLineDash(dash||[]);ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.8;
  arr.forEach((v,i)=>{const x=i/(arr.length-1)*cv.width,y=cv.height-(v/(max||1))*cv.height*0.92-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.setLineDash([]);}
-function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,FG,Math.max(...sH,1));}
+function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,BLUE,Math.max(...sH,1));}
 function drawChart(){cc.clearRect(0,0,ch.width,ch.height);
- line(cc,ch,wH,MUT,Math.max(...wH,1),[3,3]);   // writes/s (dotted gray)
- line(cc,ch,pH,FG,Math.max(...pH,2));}           // read p99 (solid white, own scale)
+ line(cc,ch,wH,BLUE,Math.max(...wH,1));    // writes/s (azure)
+ line(cc,ch,pH,PUR,Math.max(...pH,2));}     // read p99 (violet, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
 function doBurst(){fetch('/burst',{method:'POST'});}
 const COL={'directional':'#e4e4e7','mixed':'#71717a','market-maker':'#3f3f46'};
