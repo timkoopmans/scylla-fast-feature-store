@@ -121,12 +121,14 @@ cloud-dashboard blasters="24" burst_blasters="16" speed="10" days="1":
 
 # force a restart (kill + relaunch) — use to change blasters/speed/days
 cloud-dashboard-restart blasters="24" burst_blasters="16" speed="10" days="1":
-    ssh {{ remote }} "fuser -k 8090/tcp 2>/dev/null; sleep 2; echo killed"
+    @just cloud-dashboard-stop
+    @sleep 2
     @just cloud-dashboard {{ blasters }} {{ burst_blasters }} {{ speed }} {{ days }}
 
-# stop the remote dashboard
+# stop the remote dashboard AND its spawned blaster procs (fuser alone leaves
+# the blasters orphaned). The [v] class stops the pattern matching this command.
 cloud-dashboard-stop:
-    ssh {{ remote }} "fuser -k 8090/tcp 2>/dev/null || true; echo stopped"
+    ssh {{ remote }} 'pgrep -f "[v]env/bin/python" | xargs -r kill -9 2>/dev/null; fuser -k 8090/tcp 2>/dev/null; sleep 1; echo "stopped (python left: $(pgrep -cf "[v]env/bin/python"))"'
 
 # tail the remote dashboard log
 cloud-dashboard-log:
