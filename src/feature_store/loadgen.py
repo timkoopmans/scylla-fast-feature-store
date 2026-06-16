@@ -44,7 +44,7 @@ SIMPLE_WRITE = (
 )
 
 
-def _worker(wid, procs, files, max_inflight, tuning, profile, barrier, out_q):
+def _worker(wid, procs, files, max_inflight, tuning, profile, mode, barrier, out_q):
     # Load this shard's fills into memory (untimed).
     rows = []
     sample_keys = []
@@ -61,30 +61,55 @@ def _worker(wid, procs, files, max_inflight, tuning, profile, barrier, out_q):
 
     cluster = make_cluster(profile, tuning)
     session = cluster.connect(KEYSPACE)
-    pipe = Pipeline(session, max_inflight=max_inflight, sample_every=512)
 
     if tuning == "tuned":
-        stmt = prepare_all(session)["wallet_coin"]      # prepared, shard-aware, LOCAL_ONE
+        stmt = prepare_all(session)["wallet_coin"]      # prepared, shard-aware
     else:
-        from cassandra.query import SimpleStatement     # unprepared, RR, LOCAL_QUORUM
-
+        from cassandra.query import SimpleStatement     # unprepared
         stmt = SimpleStatement(SIMPLE_WRITE)
+    # consistency comes from the statement here (concurrent helper has no profile arg)
+    from cassandra import ConsistencyLevel
+    stmt.consistency_level = (ConsistencyLevel.LOCAL_ONE if tuning == "tuned"
+                              else ConsistencyLevel.LOCAL_QUORUM)
+
+    # Pre-build full param tuples (untimed) for the concurrent path.
+    if mode == "concurrent":
+        params = [(a, c, net, px, cpnl, i + 1, ts)
+                  for i, (a, c, net, px, cpnl, ts) in enumerate(rows)]
 
     # All workers finish loading (and connecting) before any starts writing, so
     # the timed write loops run concurrently and throughput = total / window is a
     # true concurrent measurement, not skewed by load-phase stagger.
     barrier.wait()
 
-    fc = 0
-    t0 = time.perf_counter()
-    for addr, coin, net, px, cpnl, ts in rows:
-        fc += 1
-        pipe.execute(stmt, (addr, coin, net, px, cpnl, fc, ts))
-    pipe.drain(max_inflight)
-    elapsed = time.perf_counter() - t0
+    if mode == "concurrent":
+        # Driver-managed concurrency: no per-request Python callback, the in-flight
+        # window is handled inside the (Cython) driver. Recommended by the perf docs.
+        from cassandra.concurrent import execute_concurrent_with_args
+        t0 = time.perf_counter()
+        results = execute_concurrent_with_args(
+            session, stmt, params, concurrency=max_inflight,
+            raise_on_first_error=False, results_generator=True)
+        n = errors = 0
+        for ok, _ in results:
+            n += 1
+            if not ok:
+                errors += 1
+        elapsed = time.perf_counter() - t0
+        out_q.put({"writes": n, "errors": errors, "elapsed": elapsed,
+                   "lat": [], "keys": sample_keys})
+    else:
+        pipe = Pipeline(session, max_inflight=max_inflight, sample_every=512)
+        fc = 0
+        t0 = time.perf_counter()
+        for addr, coin, net, px, cpnl, ts in rows:
+            fc += 1
+            pipe.execute(stmt, (addr, coin, net, px, cpnl, fc, ts))
+        pipe.drain(max_inflight)
+        elapsed = time.perf_counter() - t0
+        out_q.put({"writes": pipe.count, "errors": pipe.errors, "elapsed": elapsed,
+                   "lat": pipe.write_latency_ms(), "keys": sample_keys})
 
-    out_q.put({"writes": pipe.count, "errors": pipe.errors, "elapsed": elapsed,
-               "lat": pipe.write_latency_ms(), "keys": sample_keys})
     session.shutdown()
     cluster.shutdown()
 
@@ -96,6 +121,9 @@ def main():
     ap.add_argument("--max-inflight", type=int, default=2048)
     ap.add_argument("--tuning", default="tuned", choices=["tuned", "default"])
     ap.add_argument("--profile", default="local", choices=["local", "cloud"])
+    ap.add_argument("--mode", default="pipeline", choices=["pipeline", "concurrent"],
+                    help="pipeline = execute_async + semaphore; concurrent = "
+                         "execute_concurrent_with_args (driver-managed)")
     ap.add_argument("--sample-out", default=None,
                     help="write a sample of loaded (addr,coin) keys for the read bench")
     args = ap.parse_args()
@@ -109,7 +137,7 @@ def main():
     barrier = ctx.Barrier(args.procs)
     procs = [ctx.Process(target=_worker,
                          args=(w, args.procs, files, args.max_inflight,
-                               args.tuning, args.profile, barrier, q))
+                               args.tuning, args.profile, args.mode, barrier, q))
              for w in range(args.procs)]
     for p in procs:
         p.start()
@@ -134,7 +162,7 @@ def main():
         print(f"wrote {len(seen):,} sample keys -> {args.sample_out}")
 
     print("\n==== write load test ====")
-    print(f"profile={args.profile} procs={args.procs} "
+    print(f"profile={args.profile} mode={args.mode} procs={args.procs} "
           f"max_inflight/proc={args.max_inflight} tuning={args.tuning}")
     print(f"writes acked : {total_writes:,}  errors={total_errors:,}")
     print(f"write window : {wall:.2f}s (max worker)")
