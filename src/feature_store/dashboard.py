@@ -58,6 +58,9 @@ BURST_SECS = float(os.environ.get("FS_BURST_SECS", "8"))
 # GIL-bound at ~5k/s). 0 = off.
 BLASTERS = int(os.environ.get("FS_BLASTERS", "0"))
 BLAST_INFLIGHT = int(os.environ.get("FS_BLAST_INFLIGHT", "2048"))
+# Blasters throttle to this aggregate baseline; ⚡ BURST unthrottles them to full
+# speed, so the writes/s widget spikes on demand while reads stay flat.
+BASELINE_WPS = float(os.environ.get("FS_BASELINE_WPS", "40000"))
 
 app = FastAPI(title="ScyllaDB feature store — live")
 
@@ -193,17 +196,31 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, shared):
     stmt = prepare_all(session)["wallet_coin"]
     pipe = Pipeline(session, max_inflight=max_inflight, sample_every=4096)
     key = f"bw_{wid}"
+    per_blaster = max(1.0, BASELINE_WPS / max(1, nblast))   # throttled rate / proc
+    BATCH = 1024
     fc = 0
-    last = time.monotonic()
+    last_pub = time.monotonic()
+    last_chk = last_pub
+    bursting = False
+    t_batch = time.monotonic()
     while True:                       # loop the data forever (idempotent upserts)
         for addr, coin, net, px, cpnl, ts in rows:
             fc += 1
             pipe.execute(stmt, (addr, coin, net, px, cpnl, fc, ts))
-            if (fc & 0x3FFF) == 0:    # publish count ~every 16k writes
+            if fc % BATCH == 0:
                 now = time.monotonic()
-                if now - last >= 0.4:
+                if now - last_chk >= 0.25:        # refresh burst state + publish
+                    bursting = time.time() < shared.get("burst_until", 0.0)
+                    last_chk = now
+                if now - last_pub >= 0.4:
                     shared[key] = pipe.count
-                    last = now
+                    last_pub = now
+                if not bursting:                  # throttle this batch to baseline
+                    want = BATCH / per_blaster
+                    spent = now - t_batch
+                    if spent < want:
+                        time.sleep(want - spent)
+                t_batch = time.monotonic()
 
 
 # --------------------------------------------------------------------------- #
