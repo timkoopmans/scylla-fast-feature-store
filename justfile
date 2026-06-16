@@ -104,12 +104,24 @@ sync:
 # assumes the repo + .venv + ~/.fs-cloud.env are already set up on the remote.
 # blasters: background write-load procs (24 is the sweet spot on a 48-vCPU box).
 cloud-dashboard blasters="24" speed="10" days="1":
-    @test -n "{{remote}}" || (echo "set FS_REMOTE=user@host first" && exit 1)
-    ssh {{remote}} "cd {{rdir}} && source ~/.fs-cloud.env && fuser -k 8090/tcp 2>/dev/null; sleep 2; \
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [ -n "{{remote}}" ] || { echo "set FS_REMOTE=user@host first"; exit 1; }
+    if ssh {{remote}} 'curl -sf -m3 http://127.0.0.1:8090/stats >/dev/null 2>&1'; then
+      echo "dashboard already running on {{remote}}:8090 — leaving it as-is"
+      echo "(use 'just cloud-dashboard-restart' to change blasters/speed)"
+    else
+      ssh {{remote}} "cd {{rdir}} && source ~/.fs-cloud.env && \
         FS_SPEED={{speed}} FS_DAYS={{days}} FS_BLASTERS={{blasters}} PYTHONPATH=src \
         nohup .venv/bin/python -m uvicorn --app-dir src feature_store.dashboard:app \
         --host 0.0.0.0 --port 8090 >/tmp/fs-dashboard.log 2>&1 & sleep 1; echo launched"
-    @echo "starting on {{remote}}:8090 — now run 'just tunnel', then open http://localhost:8090"
+      echo "starting on {{remote}}:8090"
+    fi
+
+# force a restart (kill + relaunch) — use to change blasters/speed/days
+cloud-dashboard-restart blasters="24" speed="10" days="1":
+    ssh {{remote}} "fuser -k 8090/tcp 2>/dev/null; sleep 2; echo killed"
+    @just cloud-dashboard {{blasters}} {{speed}} {{days}}
 
 # stop the remote dashboard
 cloud-dashboard-stop:
@@ -123,3 +135,10 @@ cloud-dashboard-log:
 tunnel port="8090":
     @echo "tunnel localhost:{{port}} -> {{remote}}:8090  |  open http://localhost:{{port}}"
     ssh -N -L {{port}}:localhost:8090 {{remote}}
+
+# ONE COMMAND for the demo: launch the cloud dashboard + open the tunnel.
+# Open http://localhost:8090 once it says tunnelling; Ctrl-C closes the tunnel
+# (use 'just cloud-dashboard-stop' to stop the remote dashboard afterwards).
+cloud-demo blasters="24": (cloud-dashboard blasters)
+    @echo "waiting for dashboard + blasters to ramp ..." && sleep 6
+    @just tunnel
