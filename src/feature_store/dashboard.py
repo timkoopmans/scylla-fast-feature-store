@@ -99,6 +99,12 @@ def _ingest_proc(shared, base_speed, days, profile):
     engine = FeatureEngine()
     cluster = make_cluster(profile, "tuned")
     session = cluster.connect(KEYSPACE)
+    # Each demo run replays day-1 from the start; clear stale window rows from
+    # prior runs so the inference read always sees THIS run's fresh buckets.
+    try:
+        session.execute("TRUNCATE coin_window_features")
+    except Exception:
+        pass
     ps = prepare_all(session)
     pipe = Pipeline(session, max_inflight=2048)
     now0 = time.monotonic()
