@@ -50,11 +50,11 @@ def run(args) -> None:
 
     def flush_wallets_and_open_windows():
         # coin window open snapshots (freshness)
-        for coin, win, snap in engine.coins.open_snapshots():
+        for coin, win, snap in engine.open_snapshots():
             pipe.execute(ps["coin_window"], (
                 coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
                 snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
-                snap["active_wallets"], snap["hhi"], snap["large_flow"],
+                snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"],
             ))
         # wallet features (coalesced full flush of all known wallets)
         for addr, w in engine.wallets.items():
@@ -77,7 +77,7 @@ def run(args) -> None:
             pipe.execute(ps["coin_window"], (
                 coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
                 snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
-                snap["active_wallets"], snap["hhi"], snap["large_flow"],
+                snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"],
             ))
 
         # 3) optional raw-fill sinks for the hot-partition section

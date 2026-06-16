@@ -110,11 +110,11 @@ def _ingest_proc(shared, base_speed, days, profile):
     eff_speed = base_speed
 
     def flush_open():
-        for coin, win, snap in engine.coins.open_snapshots():
+        for coin, win, snap in engine.open_snapshots():
             pipe.execute(ps["coin_window"], (
                 coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
                 snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
-                snap["active_wallets"], snap["hhi"], snap["large_flow"]))
+                snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"]))
 
     for f in iter_fills(limit_days=days):
         now = time.monotonic()
@@ -145,7 +145,7 @@ def _ingest_proc(shared, base_speed, days, profile):
             pipe.execute(ps["coin_window"], (
                 coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
                 snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
-                snap["active_wallets"], snap["hhi"], snap["large_flow"]))
+                snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"]))
         n += 1
 
         if now - last_flush >= 0.25:
@@ -261,10 +261,23 @@ def _reader_thread(shared):
                 lat.append((time.perf_counter() - t0) * 1000.0)
                 rows[win] = dict(r._asdict()) if r else None
             sc = unusual_accumulation(rows["1m"], rows["5m"], rows["1h"])
-            imb_raw = (rows["1m"] or {}).get("buy_sell_imbalance", 0.0)
+            # smart-money flow over 5m (steadier than 1m), normalized by 5m volume
+            b5 = rows["5m"] or {}
+            smart = b5.get("smart_flow", 0.0) or 0.0
+            vol5 = (b5.get("volume", 0.0) or 0.0) or 1e-9
+            smart_norm = max(-1.0, min(1.0, smart / vol5))   # -1..1 for the bar
+            # signal = accumulation + smart-money agreeing on direction
+            if sc["score"] >= 0.5 and smart_norm > 0.05:
+                action = "LONG"
+            elif smart_norm < -0.15:
+                action = "SHORT"
+            else:
+                action = "—"
             board.append({"coin": coin, "score": sc["score"], "label": sc["label"],
-                          "imb": round(imb_raw, 4), "vol": h["vol"]})
-        board.sort(key=lambda x: x["score"], reverse=True)
+                          "smart": round(smart_norm, 4), "action": action,
+                          "vol": h["vol"]})
+        # rank by conviction: |smart-money flow| then score
+        board.sort(key=lambda x: (abs(x["smart"]), x["score"]), reverse=True)
         s = sorted(lat)
         # grand total writes = paced ingest + the blaster fleet; rate from delta
         snap = dict(shared)
@@ -354,34 +367,42 @@ HTML = """
 <!doctype html><html><head><meta charset=utf-8>
 <title>ScyllaDB Feature Store — LIVE</title>
 <style>
- body{background:#0c0f14;color:#dfe6f0;font:14px/1.4 -apple-system,Segoe UI,Roboto,monospace;margin:0;padding:24px}
- h1{font-size:18px;font-weight:600;color:#7fd1ff;margin:0 0 16px}
- .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1180px}
- .card{background:#141a23;border:1px solid #233040;border-radius:10px;padding:16px}
- .big{font-size:38px;font-weight:700;color:#fff}.unit{font-size:13px;color:#8aa}
+ :root{--bg:#0b0b0d;--card:#131316;--bd:#26262b;--fg:#e4e4e7;--mut:#71717a;
+       --dim:#3f3f46;--up:#26a69a;--dn:#ef5350}
+ *{box-sizing:border-box}
+ body{background:var(--bg);color:var(--fg);font:13px/1.45 -apple-system,system-ui,Segoe UI,Roboto,sans-serif;margin:0;padding:22px;font-variant-numeric:tabular-nums}
+ h1{font-size:16px;font-weight:600;letter-spacing:.2px;margin:0 0 16px;display:flex;align-items:center;gap:10px}
+ .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;max-width:1180px}
+ .card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px}
+ .big{font-size:34px;font-weight:700;color:var(--fg)}.unit{font-size:12px;color:--mut;color:var(--mut)}
  .row{display:flex;justify-content:space-between;align-items:center;margin:5px 0}
- .bar{height:13px;background:linear-gradient(90deg,#2bd47a,#7fd1ff);border-radius:3px}
- .coin{width:104px;font-weight:600}.score{width:46px;text-align:right;color:#fff}
- .hot{color:#ff6b6b}.warm{color:#ffd166}.norm{color:#8aa}
+ .coin{width:96px;font-weight:600}
+ .score{width:40px;text-align:right;color:var(--mut)}
  canvas{width:100%;display:block}
- .lat{font-size:28px;font-weight:700;color:#2bd47a}
- .sub{color:#8aa;font-size:12px}
- .pill{display:inline-block;padding:2px 8px;border-radius:10px;background:#1d2733;color:#7fd1ff;font-size:12px}
- button{background:#ff6b6b;color:#0c0f14;border:0;border-radius:8px;padding:9px 16px;font-weight:700;cursor:pointer;font-size:14px}
- button:hover{filter:brightness(1.1)} .burston{box-shadow:0 0 14px #ff6b6b}
- .legend{font-size:11px;color:#8aa}.gr{color:#2bd47a}.bl{color:#7fd1ff}
- .imbwrap{display:flex;align-items:center;height:12px;margin:0 10px;flex:1}
- .imbbar{height:12px}.sell{background:#ff6b6b;border-radius:3px 0 0 3px}.buy{background:#2bd47a;border-radius:0 3px 3px 0}
- .archseg{height:18px;display:inline-block} .achip{font-size:11px;margin-right:10px}
+ .lat{font-size:26px;font-weight:700;color:var(--fg)}
+ .sub{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
+ .pill{display:inline-block;padding:2px 8px;border-radius:6px;border:1px solid var(--bd);color:var(--mut);font-size:11px}
+ button{background:var(--fg);color:var(--bg);border:0;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:13px;letter-spacing:.3px}
+ button:hover{filter:brightness(.92)} .burston{outline:2px solid var(--fg);outline-offset:2px}
+ .legend{font-size:10px;color:var(--mut);text-transform:none;letter-spacing:0}
+ .gbar{height:12px;background:var(--dim);border-radius:3px}
+ .flow{display:flex;flex:1;height:12px;margin:0 10px}
+ .fhalf{flex:1;display:flex;height:12px}.fbar{height:12px}
+ .sell{background:var(--dn);border-radius:3px 0 0 3px;margin-left:auto}
+ .buy{background:var(--up);border-radius:0 3px 3px 0}
+ .chip{width:52px;text-align:center;font-size:11px;font-weight:700;border-radius:5px;padding:2px 0}
+ .long{background:var(--up);color:var(--bg)}.short{background:var(--dn);color:var(--bg)}
+ .flat{background:transparent;color:var(--mut);border:1px solid var(--bd)}
+ .seg{height:18px;display:inline-block}.achip{font-size:11px;margin-right:14px}
 </style></head><body>
-<h1><img src="__SCYLLA__" height=36 style=vertical-align:middle>
+<h1><img src="__SCYLLA__" height=30 style=vertical-align:middle>
   Feature Store — live replay of the Hyperliquid
-  <img src="__HL__" height=28 style=vertical-align:middle> fills firehose
+  <img src="__HL__" height=24 style=vertical-align:middle> fills firehose
   <button id=burst onclick=doBurst()>⚡ BURST</button>
   <span class=pill id=burststate>steady</span></h1>
 <div class=grid>
   <div class=card>
-    <div class=sub>FIREHOSE</div>
+    <div class=sub>Firehose</div>
     <div class=big id=fps>0<span class=unit> fills/s</span></div>
     <canvas id=spark width=540 height=52></canvas>
     <div class=row><span class=sub>writes/s</span><b id=wps>0</b></div>
@@ -390,22 +411,23 @@ HTML = """
     <div class=row><span class=sub>data clock</span><span class=pill id=clock>—</span></div>
   </div>
   <div class=card>
-    <div class=sub>READ TAIL vs WRITE LOAD &nbsp;<span class=legend><span class=gr>■</span> read p99 (ms) &nbsp;<span class=bl>■</span> writes/s</span></div>
+    <div class=sub>Read tail vs write load &nbsp;<span class=legend>— read p99 (ms) &nbsp;·· writes/s</span></div>
     <canvas id=chart width=540 height=120></canvas>
     <div class=lat id=p99>0.000<span class=unit> ms &nbsp;p99 point read</span></div>
     <div class=row><span class=sub>feature freshness (write→read)</span><b id=fresh>—</b></div>
-    <div class=sub>point-reads stay fast while writes spike — hit BURST to prove it</div>
+    <div class=sub style=text-transform:none;letter-spacing:0>point-reads stay fast while writes spike — hit BURST</div>
   </div>
   <div class=card>
-    <div class=sub>WRITE LOAD BY COIN — the skew that drives partition-key design</div>
+    <div class=sub>Write load by coin — the skew that drives partition-key design</div>
     <div id=hot></div>
   </div>
   <div class=card>
-    <div class=sub>UNUSUAL ACCUMULATION — scored live from fresh features (taker buy/sell imbalance)</div>
+    <div class=sub>Cross-ticker signal board</div>
+    <div class=legend style=margin:2px 0 8px>smart-money flow (sell ◀ ▶ buy) · accumulation score · action</div>
     <div id=board></div>
   </div>
   <div class=card style=grid-column:1/3>
-    <div class=sub>WALLET ARCHETYPE MIX</div>
+    <div class=sub>Wallet archetype mix</div>
     <div id=archbar style=margin:8px 0></div>
     <div id=archlegend></div>
   </div>
@@ -414,17 +436,16 @@ HTML = """
 const sH=[],pH=[],wH=[];
 const sp=document.getElementById('spark'),sc=sp.getContext('2d');
 const ch=document.getElementById('chart'),cc=ch.getContext('2d');
-function line(ctx,cv,arr,color,max){if(arr.length<2)return;ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=2;
- arr.forEach((v,i)=>{const x=i/(arr.length-1)*cv.width,y=cv.height-(v/(max||1))*cv.height*0.92-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();}
-function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,'#7fd1ff',Math.max(...sH,1));}
+const FG='#e4e4e7',MUT='#71717a';
+function line(ctx,cv,arr,color,max,dash){if(arr.length<2)return;ctx.setLineDash(dash||[]);ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.8;
+ arr.forEach((v,i)=>{const x=i/(arr.length-1)*cv.width,y=cv.height-(v/(max||1))*cv.height*0.92-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.setLineDash([]);}
+function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,FG,Math.max(...sH,1));}
 function drawChart(){cc.clearRect(0,0,ch.width,ch.height);
- line(cc,ch,wH,'#7fd1ff',Math.max(...wH,1));      // writes/s
- line(cc,ch,pH,'#2bd47a',Math.max(...pH,2));}      // read p99 (own scale)
-function cls(l){return l=='unusual-accumulation'?'hot':l=='elevated'?'warm':'norm'}
+ line(cc,ch,wH,MUT,Math.max(...wH,1),[3,3]);   // writes/s (dotted gray)
+ line(cc,ch,pH,FG,Math.max(...pH,2));}           // read p99 (solid white, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
-function age(ms){return ms==null?'—':ms<1000?ms+'ms':(ms/1000).toFixed(1)+'s'}
 function doBurst(){fetch('/burst',{method:'POST'});}
-const COL={'market-maker':'#7fd1ff','directional':'#ff6b6b','mixed':'#ffd166'};
+const COL={'directional':'#e4e4e7','mixed':'#71717a','market-maker':'#3f3f46'};
 const ws=new WebSocket('ws://'+location.host+'/ws');
 ws.onmessage=e=>{const s=JSON.parse(e.data);
  fps.innerHTML=fmt(s.fills_per_s)+'<span class=unit> fills/s</span>';
@@ -437,24 +458,25 @@ ws.onmessage=e=>{const s=JSON.parse(e.data);
  document.getElementById('burst').className=s.bursting?'burston':'';
  sH.push(s.fills_per_s); wH.push(s.writes_per_s); pH.push(s.read_p99_ms);
  [sH,wH,pH].forEach(a=>{if(a.length>120)a.shift()}); drawSpark(); drawChart();
- // hot-partition skew bars (by write volume)
+ // write-load skew bars (monochrome)
  const hmx=Math.max(...s.hot.map(h=>h.vol),1);
  hot.innerHTML=s.hot.map(h=>`<div class=row><span class=coin>${h.coin}</span>`+
-  `<div style=flex:1;margin:0 10px><div class=bar style="width:${h.vol/hmx*100}%;background:linear-gradient(90deg,#ff6b6b,#ffd166)"></div></div>`+
-  `<span class=sub style=width:64px;text-align:right>${fmt(h.vol)}</span></div>`).join('');
- // accumulation scoreboard + imbalance
- const mx=Math.max(...s.scoreboard.map(b=>b.score),0.01);
- board.innerHTML=s.scoreboard.map(b=>{const im=b.imb||0,L=im<0?(-im*50):0,R=im>0?(im*50):0;
-  return `<div class=row><span class="coin ${cls(b.label)}">${b.coin}</span>`+
-   `<div class=imbwrap><div style=flex:1;text-align:right><div class="imbbar sell" style="width:${L}%;margin-left:auto"></div></div>`+
-   `<div style=flex:1><div class="imbbar buy" style="width:${R}%"></div></div></div>`+
-   `<span class=score>${b.score.toFixed(2)}</span></div>`}).join('');
- // archetype mix
+  `<div style=flex:1;margin:0 10px><div class=gbar style="width:${h.vol/hmx*100}%"></div></div>`+
+  `<span class=sub style=width:62px;text-align:right>${fmt(h.vol)}</span></div>`).join('');
+ // cross-ticker signal board: smart-money flow (diverging) + score + action
+ board.innerHTML=s.scoreboard.map(b=>{const sm=b.smart||0,L=sm<0?(-sm*100):0,R=sm>0?(sm*100):0;
+  const chip=b.action=='LONG'?'long':b.action=='SHORT'?'short':'flat';
+  return `<div class=row><span class=coin>${b.coin}</span>`+
+   `<div class=flow><div class=fhalf><div class="fbar sell" style=width:${L}%></div></div>`+
+   `<div class=fhalf><div class="fbar buy" style=width:${R}%></div></div></div>`+
+   `<span class=score>${b.score.toFixed(2)}</span>`+
+   `<span class="chip ${chip}">${b.action}</span></div>`}).join('');
+ // archetype mix (grayscale shades)
  const a=s.arch||{},tot=(a['market-maker']||0)+(a['directional']||0)+(a['mixed']||0)||1;
- archbar.innerHTML=['market-maker','directional','mixed'].map(k=>
-  `<span class=archseg style="width:${(a[k]||0)/tot*100}%;background:${COL[k]}"></span>`).join('');
- archlegend.innerHTML=['market-maker','directional','mixed'].map(k=>
-  `<span class=achip style=color:${COL[k]}>■ ${k}: ${(a[k]||0).toLocaleString()}</span>`).join('');
+ archbar.innerHTML=['directional','mixed','market-maker'].map(k=>
+  `<span class=seg style="width:${(a[k]||0)/tot*100}%;background:${COL[k]}"></span>`).join('');
+ archlegend.innerHTML=['directional','mixed','market-maker'].map(k=>
+  `<span class=achip><span style="color:${COL[k]}">■</span> ${k}: ${(a[k]||0).toLocaleString()}</span>`).join('');
 };
 </script></body></html>
 """

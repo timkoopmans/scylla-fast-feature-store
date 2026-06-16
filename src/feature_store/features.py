@@ -19,6 +19,17 @@ WINDOWS = {"1m": 60, "5m": 300, "1h": 3600}
 LARGE_NOTIONAL = 100_000.0   # a "large wallet" move in a bucket, USD notional
 
 
+def wallet_weight(ws) -> float:
+    """Smart-money weight for a wallet: profitable, directional wallets count
+    most; market-makers (churn, no net view) count ~0. Used to turn raw per-coin
+    flow into 'smart-money flow' — the signal-generation join."""
+    if ws is None:
+        return 0.0
+    arch_w = {"directional": 1.0, "mixed": 0.5}.get(ws.archetype, 0.0)
+    pnl_w = 1.0 if ws.cum_realized_pnl > 0 else 0.25   # follow the ones making money
+    return arch_w * pnl_w
+
+
 # ---------------------------------------------------------------------------
 # 1) per (wallet, coin)
 # ---------------------------------------------------------------------------
@@ -122,13 +133,19 @@ class Bucket:
             n if f.is_buy else -n
         )
 
-    def snapshot(self) -> dict:
+    def snapshot(self, wallets: dict | None = None) -> dict:
         tb, ts_ = self.taker_buy, self.taker_sell
         imb = (tb - ts_) / (tb + ts_) if (tb + ts_) > 0 else 0.0
         flows = self.wallet_flow
         gross = sum(abs(v) for v in flows.values())
         hhi = sum((abs(v) / gross) ** 2 for v in flows.values()) if gross > 0 else 0.0
         large_flow = sum(v for v in flows.values() if abs(v) >= LARGE_NOTIONAL)
+        # smart-money flow: net notional weighted by each wallet's "smartness"
+        # (profitable + directional count most; market-makers ~0). This is the
+        # per-coin × per-wallet join that turns raw flow into a trade signal.
+        smart_flow = 0.0
+        if wallets is not None:
+            smart_flow = sum(v * wallet_weight(wallets.get(a)) for a, v in flows.items())
         return {
             "bucket_ts": self.bucket_ts,
             "volume": self.volume,
@@ -138,6 +155,7 @@ class Bucket:
             "active_wallets": len(flows),
             "hhi": hhi,
             "large_flow": large_flow,
+            "smart_flow": smart_flow,
         }
 
 
@@ -152,7 +170,7 @@ class CoinWindowAggregator:
         # (coin, window) -> Bucket
         self.open: dict[tuple[str, str], Bucket] = {}
 
-    def update(self, f: Fill):
+    def update(self, f: Fill, wallets: dict | None = None):
         """Return list of (coin, window, snapshot) for buckets that just closed."""
         closed = []
         sec = f.ts_ms // 1000
@@ -164,17 +182,17 @@ class CoinWindowAggregator:
                 self.open[key] = Bucket(b_ts)
             elif cur.bucket_ts != b_ts:
                 if b_ts > cur.bucket_ts:           # rolled forward -> close old
-                    closed.append((f.coin, win, cur.snapshot()))
+                    closed.append((f.coin, win, cur.snapshot(wallets)))
                     self.open[key] = Bucket(b_ts)
                 else:
                     continue                        # late event for a past bucket
             self.open[key].add(f)
         return closed
 
-    def open_snapshots(self):
+    def open_snapshots(self, wallets: dict | None = None):
         """Yield (coin, window, snapshot) for all currently-open buckets."""
         for (coin, win), b in self.open.items():
-            yield coin, win, b.snapshot()
+            yield coin, win, b.snapshot(wallets)
 
 
 class FeatureEngine:
@@ -196,5 +214,9 @@ class FeatureEngine:
             w = self.wallets[f.addr] = WalletState()
         w.update(f)
 
-        closed = self.coins.update(f)
+        closed = self.coins.update(f, self.wallets)
         return wc, w, closed
+
+    def open_snapshots(self):
+        """Open window snapshots, smart-flow-weighted by current wallet state."""
+        return self.coins.open_snapshots(self.wallets)

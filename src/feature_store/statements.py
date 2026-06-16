@@ -9,8 +9,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?)
 UPSERT_COIN_WINDOW = """
 INSERT INTO coin_window_features
   (coin, window, bucket_ts, volume, taker_buy, taker_sell, buy_sell_imbalance,
-   active_wallets, hhi, large_flow)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+   active_wallets, hhi, large_flow, smart_flow)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 """
 
 UPSERT_WALLET = """

@@ -63,6 +63,7 @@ CREATE TABLE IF NOT EXISTS coin_window_features (
     active_wallets    int,
     hhi               double,     -- Herfindahl index of net-position concentration
     large_flow        double,     -- net signed notional from large wallets
+    smart_flow        double,     -- net notional weighted by wallet smartness (signal)
     PRIMARY KEY ((coin, window), bucket_ts)
 ) WITH CLUSTERING ORDER BY (bucket_ts DESC)
   AND default_time_to_live = 172800           -- 2 days
