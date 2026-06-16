@@ -214,8 +214,7 @@ def _reader_thread(shared):
     session = cluster.connect(KEYSPACE)
     ps = prepare_all(session)
     lat = deque(maxlen=3000)
-    prev_w = None
-    prev_wt = 0.0
+    whist = deque()   # (t, total_writes) over a sliding window, for a smooth rate
     while _proc.get("on", True):
         # Freshness probe: write a sentinel feature, immediately read it back, and
         # time the write->visible round trip. This is the store's freshness floor —
@@ -250,8 +249,11 @@ def _reader_thread(shared):
         total_w = snap.get("writes_total", 0) + sum(
             v for k, v in snap.items() if k.startswith("bw_"))
         now_w = time.monotonic()
-        wps = (total_w - prev_w) / (now_w - prev_wt) if prev_w is not None else 0.0
-        prev_w, prev_wt = total_w, now_w
+        whist.append((now_w, total_w))
+        while len(whist) > 1 and now_w - whist[0][0] > 2.5:   # ~2.5s window
+            whist.popleft()
+        wps = ((whist[-1][1] - whist[0][1]) / (whist[-1][0] - whist[0][0])
+               if len(whist) > 1 and whist[-1][0] > whist[0][0] else 0.0)
         with _lock:
             STATS["scoreboard"] = board
             STATS["hot"] = sorted(hot, key=lambda x: x["vol"], reverse=True)
