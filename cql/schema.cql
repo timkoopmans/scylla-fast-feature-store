@@ -39,8 +39,10 @@ CREATE TABLE IF NOT EXISTS wallet_coin_features (
     fill_count    bigint,
     last_ts       timestamp,   -- last fill seen (freshness probe)
     PRIMARY KEY ((addr), coin)
-) WITH compaction = {'class': 'LeveledCompactionStrategy'};
--- LCS: this is an overwrite-heavy, point-read table -> keep read amplification low.
+) WITH compaction = {'class': 'IncrementalCompactionStrategy'};
+-- ICS: ScyllaDB's incremental compaction — STCS write efficiency without the
+-- ~2x space amplification, and bounded read amplification. The right default for
+-- this overwrite-heavy, point-read table.
 
 -- ----------------------------------------------------------------------------
 -- 2) Per-coin rolling window features (1m / 5m / 1h snapshots).
@@ -84,7 +86,7 @@ CREATE TABLE IF NOT EXISTS wallet_features (
     churn             double,     -- closes / (opens+closes)
     archetype         text,       -- 'market-maker' | 'directional' | 'mixed'
     last_ts           timestamp
-) WITH compaction = {'class': 'LeveledCompactionStrategy'};
+) WITH compaction = {'class': 'IncrementalCompactionStrategy'};  -- ICS (see above)
 
 -- ----------------------------------------------------------------------------
 -- 4) Raw-fill sink used ONLY to demonstrate hot-partition avoidance (section 3).
