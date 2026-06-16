@@ -44,7 +44,7 @@ SIMPLE_WRITE = (
 )
 
 
-def _worker(wid, procs, files, max_inflight, tuning, profile, out_q):
+def _worker(wid, procs, files, max_inflight, tuning, profile, barrier, out_q):
     # Load this shard's fills into memory (untimed).
     rows = []
     sample_keys = []
@@ -69,6 +69,11 @@ def _worker(wid, procs, files, max_inflight, tuning, profile, out_q):
         from cassandra.query import SimpleStatement     # unprepared, RR, LOCAL_QUORUM
 
         stmt = SimpleStatement(SIMPLE_WRITE)
+
+    # All workers finish loading (and connecting) before any starts writing, so
+    # the timed write loops run concurrently and throughput = total / window is a
+    # true concurrent measurement, not skewed by load-phase stagger.
+    barrier.wait()
 
     fc = 0
     t0 = time.perf_counter()
@@ -101,9 +106,10 @@ def main():
 
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
+    barrier = ctx.Barrier(args.procs)
     procs = [ctx.Process(target=_worker,
                          args=(w, args.procs, files, args.max_inflight,
-                               args.tuning, args.profile, q))
+                               args.tuning, args.profile, barrier, q))
              for w in range(args.procs)]
     for p in procs:
         p.start()
