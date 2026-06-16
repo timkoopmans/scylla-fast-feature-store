@@ -27,6 +27,19 @@ def main():
 
     cluster = make_cluster(args.profile, tuning="tuned")
     session = cluster.connect()
+
+    # Create the keyspace with NetworkTopologyStrategy bound to the cluster's
+    # actual local DC (datacenter1 locally, AWS_US_EAST_1 on ScyllaDB Cloud) so
+    # this works on any target. The file's CREATE KEYSPACE IF NOT EXISTS is then
+    # a no-op.
+    dc = session.execute("SELECT data_center FROM system.local").one().data_center
+    rf = min(3, 1 + len(list(session.execute("SELECT peer FROM system.peers"))))
+    print(f"-> CREATE KEYSPACE feature_store ({dc} RF={rf}) ...")
+    session.execute(
+        "CREATE KEYSPACE IF NOT EXISTS feature_store WITH replication = "
+        f"{{'class': 'NetworkTopologyStrategy', '{dc}': {rf}}}"
+    )
+
     with open(args.schema) as fh:
         text = fh.read()
     for stmt in split_statements(text):
