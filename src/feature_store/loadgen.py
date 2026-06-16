@@ -36,9 +36,10 @@ SIMPLE_WRITE = (
 )
 
 
-def _worker(wid, procs, files, max_inflight, tuning, out_q):
+def _worker(wid, procs, files, max_inflight, tuning, profile, out_q):
     # Load this shard's fills into memory (untimed).
     rows = []
+    sample_keys = []
     for path in files:
         df = pl.read_parquet(path, columns=COLUMNS)
         for addr, coin, px, sz, side, t, cpnl, crossed in df.iter_rows():
@@ -47,8 +48,10 @@ def _worker(wid, procs, files, max_inflight, tuning, out_q):
             net = sz if side == "B" else -sz
             rows.append((addr, coin, net, px, (cpnl or 0.0),
                          dt.datetime.fromtimestamp(t / 1000.0, tz=UTC)))
+            if len(sample_keys) < 2000 and (len(rows) % 53 == 0):
+                sample_keys.append((addr, coin))
 
-    cluster = make_cluster("local", tuning)
+    cluster = make_cluster(profile, tuning)
     session = cluster.connect(KEYSPACE)
     pipe = Pipeline(session, max_inflight=max_inflight, sample_every=512)
 
@@ -68,7 +71,7 @@ def _worker(wid, procs, files, max_inflight, tuning, out_q):
     elapsed = time.perf_counter() - t0
 
     out_q.put({"writes": pipe.count, "errors": pipe.errors, "elapsed": elapsed,
-               "lat": pipe.write_latency_ms()})
+               "lat": pipe.write_latency_ms(), "keys": sample_keys})
     session.shutdown()
     cluster.shutdown()
 
@@ -79,6 +82,9 @@ def main():
     ap.add_argument("--days", type=int, default=1)
     ap.add_argument("--max-inflight", type=int, default=2048)
     ap.add_argument("--tuning", default="tuned", choices=["tuned", "default"])
+    ap.add_argument("--profile", default="local", choices=["local", "cloud"])
+    ap.add_argument("--sample-out", default=None,
+                    help="write a sample of loaded (addr,coin) keys for the read bench")
     args = ap.parse_args()
 
     files = day_files(args.days)
@@ -89,7 +95,7 @@ def main():
     q = ctx.Queue()
     procs = [ctx.Process(target=_worker,
                          args=(w, args.procs, files, args.max_inflight,
-                               args.tuning, q))
+                               args.tuning, args.profile, q))
              for w in range(args.procs)]
     for p in procs:
         p.start()
@@ -103,8 +109,19 @@ def main():
     wall = max(r["elapsed"] for r in results)
     lat = sorted(x for r in results for x in r["lat"])
     qf = lambda p: lat[min(len(lat) - 1, int(len(lat) * p))] if lat else 0.0
+    if args.sample_out:
+        seen = set()
+        with open(args.sample_out, "w") as fh:
+            for r in results:
+                for addr, coin in r.get("keys", []):
+                    if (addr, coin) not in seen:
+                        seen.add((addr, coin))
+                        fh.write(f"{addr},{coin}\n")
+        print(f"wrote {len(seen):,} sample keys -> {args.sample_out}")
+
     print("\n==== write load test ====")
-    print(f"procs={args.procs} max_inflight/proc={args.max_inflight} tuning={args.tuning}")
+    print(f"profile={args.profile} procs={args.procs} "
+          f"max_inflight/proc={args.max_inflight} tuning={args.tuning}")
     print(f"writes acked : {total_writes:,}  errors={total_errors:,}")
     print(f"write window : {wall:.2f}s (max worker)")
     print(f"throughput   : {total_writes/wall:,.0f} writes/s")
