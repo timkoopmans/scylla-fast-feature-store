@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import time
 from datetime import timezone
 
@@ -137,7 +138,8 @@ def run(args) -> None:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--profile", default="local", choices=["local", "cloud"])
+    ap.add_argument("--profile", default=os.environ.get("FS_PROFILE", "local"),
+                    choices=["local", "cloud"])
     ap.add_argument("--tuning", default="tuned", choices=["tuned", "default"])
     ap.add_argument("--speed", type=float, default=0.0,
                     help="replay speed multiplier; 0 = max (no sleep)")

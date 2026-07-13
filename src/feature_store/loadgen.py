@@ -124,7 +124,8 @@ def main():
     ap.add_argument("--days", type=int, default=1)
     ap.add_argument("--max-inflight", type=int, default=2048)
     ap.add_argument("--tuning", default="tuned", choices=["tuned", "default"])
-    ap.add_argument("--profile", default="local", choices=["local", "cloud"])
+    ap.add_argument("--profile", default=os.environ.get("FS_PROFILE", "local"),
+                    choices=["local", "cloud"])
     ap.add_argument("--mode", default="pipeline", choices=["pipeline", "concurrent"],
                     help="pipeline = execute_async + semaphore; concurrent = "
                          "execute_concurrent_with_args (driver-managed)")

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
 
 from .config import make_cluster
@@ -22,7 +23,8 @@ def split_statements(text: str):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--schema", default="cql/schema.cql")
-    ap.add_argument("--profile", default="local", choices=["local", "cloud"])
+    ap.add_argument("--profile", default=os.environ.get("FS_PROFILE", "local"),
+                    choices=["local", "cloud"])
     args = ap.parse_args()
 
     cluster = make_cluster(args.profile, tuning="tuned")

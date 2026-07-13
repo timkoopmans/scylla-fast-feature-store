@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import multiprocessing as mp
+import os
 import threading
 import time
 
@@ -146,7 +147,8 @@ def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("read")
-    r.add_argument("--profile", default="local", choices=["local", "cloud"])
+    r.add_argument("--profile", default=os.environ.get("FS_PROFILE", "local"),
+                    choices=["local", "cloud"])
     r.add_argument("--tuning", default="tuned", choices=["tuned", "default"])
     r.add_argument("--keys", default="sample_keys.csv")
     r.add_argument("--n", type=int, default=600_000)
