@@ -11,7 +11,7 @@
 py := ".venv/bin/python"
 host := env_var_or_default("FS_HOST", "localhost")
 # remote demo host for the cloud dashboard/tunnel recipes, e.g. FS_REMOTE=ubuntu@1.2.3.4
-remote := env_var_or_default("FS_REMOTE", "ubuntu@3.86.242.103")
+remote := env_var_or_default("FS_REMOTE", "ubuntu@3.94.101.236")
 rdir := env_var_or_default("FS_REMOTE_DIR", "scylla-fast-feature-store")
 
 export PYTHONPATH := "src"
@@ -100,6 +100,11 @@ sync:
     FS_HOST={{ host }} scripts/sync.sh
 
 # --- remote demo control (run from your laptop; set FS_REMOTE=user@host) ---
+# apply cql/schema.cql on the remote host against ScyllaDB Cloud
+cloud-schema:
+    ssh {{ remote }} "cd {{ rdir }} && source ~/.fs-cloud.env && \
+        PYTHONPATH=src .venv/bin/python -m feature_store.apply_schema --schema cql/schema.cql"
+
 # launch the live dashboard on the remote host against ScyllaDB Cloud (detached).
 # assumes the repo + .venv + ~/.fs-cloud.env are already set up on the remote.
 # blasters: background write-load procs (24 is the sweet spot on a 48-vCPU box).
