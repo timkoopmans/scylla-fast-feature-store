@@ -53,7 +53,7 @@ UTC = timezone.utc
 SPEED = float(os.environ.get("FS_SPEED", "30"))
 DAYS = int(os.environ.get("FS_DAYS", "3"))
 PROFILE = os.environ.get("FS_PROFILE", "local")
-BURST_SECS = float(os.environ.get("FS_BURST_SECS", "8"))
+BURST_SECS = float(os.environ.get("FS_BURST_SECS", "15"))
 # Background write-load fleet: N processes re-upserting fills at max speed so the
 # dashboard shows ScyllaDB absorbing real write load (the single paced ingest is
 # GIL-bound at ~5k/s). 0 = off.
