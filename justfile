@@ -11,7 +11,7 @@
 py := ".venv/bin/python"
 host := env_var_or_default("FS_HOST", "localhost")
 # remote demo host for the cloud dashboard/tunnel recipes, e.g. FS_REMOTE=ubuntu@1.2.3.4
-remote := env_var_or_default("FS_REMOTE", "ubuntu@3.94.101.236")
+remote := env_var_or_default("FS_REMOTE", "ubuntu@34.205.16.144")
 rdir := env_var_or_default("FS_REMOTE_DIR", "scylla-fast-feature-store")
 
 export PYTHONPATH := "src"
@@ -108,7 +108,7 @@ cloud-schema:
 # launch the live dashboard on the remote host against ScyllaDB Cloud (detached).
 # assumes the repo + .venv + ~/.fs-cloud.env are already set up on the remote.
 # blasters: background write-load procs (24 is the sweet spot on a 48-vCPU box).
-cloud-dashboard blasters="20" burst_blasters="16" speed="10" days="1":
+cloud-dashboard blasters="24" burst_blasters="16" speed="10" days="1":
     #!/usr/bin/env bash
     set -euo pipefail
     [ -n "{{ remote }}" ] || { echo "set FS_REMOTE=user@host first"; exit 1; }
@@ -125,7 +125,7 @@ cloud-dashboard blasters="20" burst_blasters="16" speed="10" days="1":
     fi
 
 # force a restart (kill + relaunch) — use to change blasters/speed/days
-cloud-dashboard-restart blasters="20" burst_blasters="16" speed="10" days="1":
+cloud-dashboard-restart blasters="24" burst_blasters="16" speed="0" days="1":
     @just cloud-dashboard-stop
     @sleep 2
     @just cloud-dashboard {{ blasters }} {{ burst_blasters }} {{ speed }} {{ days }}
@@ -147,6 +147,6 @@ tunnel port="8090":
 # ONE COMMAND for the demo: launch the cloud dashboard + open the tunnel.
 # Open http://localhost:8090 once it says tunnelling; Ctrl-C closes the tunnel
 # (use 'just cloud-dashboard-stop' to stop the remote dashboard afterwards).
-cloud-demo blasters="20" burst_blasters="16": (cloud-dashboard blasters burst_blasters)
+cloud-demo blasters="24" burst_blasters="16": (cloud-dashboard blasters burst_blasters)
     @echo "waiting for dashboard + blasters to ramp ..." && sleep 6
     @just tunnel

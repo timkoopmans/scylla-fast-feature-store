@@ -467,7 +467,6 @@ HTML = """
  .coin{width:96px;font-weight:600}
  .score{width:40px;text-align:right;color:var(--mut)}
  canvas{width:100%;display:block}
- .lat{font-size:26px;font-weight:700;color:var(--fg)}
  .sub{color:var(--mut);font-size:11px;text-transform:uppercase;letter-spacing:.6px}
  .pill{display:inline-block;padding:2px 8px;border-radius:6px;border:1px solid var(--bd);color:var(--mut);font-size:11px}
  button{background:var(--fg);color:var(--bg);border:0;border-radius:8px;padding:8px 14px;font-weight:700;cursor:pointer;font-size:13px;letter-spacing:.3px}
@@ -482,12 +481,16 @@ HTML = """
  .long{background:var(--up);color:var(--bg)}.short{background:var(--dn);color:var(--bg)}
  .flat{background:transparent;color:var(--mut);border:1px solid var(--bd)}
  .seg{height:18px;display:inline-block}.achip{font-size:11px;margin-right:14px}
+ .ampend{position:absolute;top:50%;transform:translateY(-50%)}
+ .ampx{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:12px;
+       font-weight:700;color:var(--mut);background:var(--card);border:1px solid var(--bd);
+       border-radius:6px;padding:2px 10px;white-space:nowrap}
 </style></head><body>
 <header>
   <div class=brand>
     <img src="__SCYLLA__" height=28>
     <img src="__HL__" height=22 style=opacity:.85>
-    <span class=title>Feature Store <b>— live Hyperliquid fills firehose</b></span>
+    <span class=title>ScyllaDB + Hyperliquid Feature Store <b></span>
   </div>
   <div class=ctl>
     <button id=burst onclick=doBurst()>⚡ BURST</button>
@@ -496,20 +499,25 @@ HTML = """
 </header>
 <div class=grid>
   <div class=card>
-    <div class=sub>Firehose</div>
+    <div class=sub>Hyperliquid Validator</div>
     <div class=big id=fps>0<span class=unit> fills/s</span></div>
     <canvas id=spark width=540 height=52></canvas>
-    <div class=row><span class=sub>writes/s</span><b id=wps>0</b></div>
     <div class=row><span class=sub>fills total</span><b id=ftot>0</b></div>
     <div class=row><span class=sub>active coins / wallets</span><b id=card>0</b></div>
     <div class=row><span class=sub>data clock</span><span class=pill id=clock>—</span></div>
   </div>
   <div class=card>
-    <div class=sub>Read tail vs write load &nbsp;<span class=legend><b style=color:#2bd6c6>● read p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● writes/s</b></span></div>
-    <canvas id=chart width=540 height=120></canvas>
-    <div class=lat id=p99>0.000<span class=unit> ms &nbsp;p99 point read</span></div>
-    <div class=row><span class=sub>feature freshness (write→read)</span><b id=fresh>—</b></div>
-    <div class=sub style=text-transform:none;letter-spacing:0>point-reads stay fast while writes spike — hit BURST</div>
+    <div class=sub>ScyllaDB Feature Store</div>
+    <div class=big><span id=p99>0.000</span><span class=unit> ms</span> <span class=legend><b style=color:#2bd6c6>● read p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● writes/s</b></span></div>
+    <canvas id=chart width=540 height=52></canvas>
+    <div class=row><span class=sub>feature freshness (Δt = read - write)</span><b id=fresh>—</b></div>
+    <div class=row><span class=sub>writes/s</span><b id=wps>0</b></div>
+  </div>
+  <div class=card style=grid-column:1/3;position:relative;padding:8px>
+    <canvas id=amp width=1130 height=64></canvas>
+    <span class="sub ampend" style=left:14px>fills</span>
+    <span class="sub ampend" style=right:14px>writes</span>
+    <span class=ampx id=ampx>× —</span>
   </div>
   <div class=card>
     <div class=sub>Write load by coin — the skew that drives partition-key design</div>
@@ -539,6 +547,30 @@ function drawChart(){cc.clearRect(0,0,ch.width,ch.height);
  line(cc,ch,pH,TEAL,Math.max(...pH,2));}     // read p99 (ScyllaDB teal, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
 function doBurst(){fetch('/burst',{method:'POST'});}
+// --- write-amplification flow: fills (white) split into writes (teal) ---
+const am=document.getElementById('amp'),ac=am.getContext('2d');
+let liveFps=0,liveWps=0,parts=[],spawnAcc=0,lastT=performance.now();
+function ampTick(t){
+ const dt=Math.min((t-lastT)/1000,.05);lastT=t;
+ const mid=am.width*.45;
+ // one particle ≈ 100 fills/s; keep the pipe legible at any rate
+ spawnAcc+=Math.min(30,Math.max(3,liveFps/100))*dt;
+ while(spawnAcc>1&&parts.length<500){spawnAcc--;
+  parts.push({x:0,y:am.height/2+(Math.random()*26-13),v:150+Math.random()*70,vy:0,teal:0});}
+ const k=Math.min(6,Math.max(2,Math.round(liveWps/Math.max(liveFps,1)/15)));
+ const next=[];
+ for(const p of parts){
+  p.x+=p.v*dt;p.y+=p.vy*dt;
+  if(!p.teal&&p.x>=mid){ // amplification point: 1 fill -> k writes
+   for(let i=0;i<k;i++)next.push({x:mid,y:p.y,v:p.v*1.15,vy:(i-(k-1)/2)*16,teal:1});
+   continue;}
+  if(p.x<am.width&&p.y>2&&p.y<am.height-2)next.push(p);}
+ parts=next;
+ ac.clearRect(0,0,am.width,am.height);
+ for(const p of parts){ac.fillStyle=p.teal?'rgba(43,214,198,.8)':'rgba(228,228,231,.85)';
+  ac.beginPath();ac.arc(p.x,p.y,p.teal?1.5:2,0,7);ac.fill();}
+ requestAnimationFrame(ampTick);}
+requestAnimationFrame(ampTick);
 const COL={'directional':'#e4e4e7','mixed':'#71717a','market-maker':'#3f3f46'};
 const ws=new WebSocket('ws://'+location.host+'/ws');
 ws.onmessage=e=>{const s=JSON.parse(e.data);
@@ -546,8 +578,10 @@ ws.onmessage=e=>{const s=JSON.parse(e.data);
  wps.textContent=fmt(s.writes_per_s); ftot.textContent=s.fills_total.toLocaleString();
  card.textContent=s.active_coins+' / '+s.wallets.toLocaleString();
  clock.textContent=(s.data_time||'—').replace('T',' ').slice(0,19);
- p99.innerHTML=s.read_p99_ms.toFixed(3)+'<span class=unit> ms &nbsp;p99 point read</span>';
+ p99.textContent=s.read_p99_ms.toFixed(3);
  fresh.textContent=s.fresh_us<1000?s.fresh_us.toFixed(0)+' µs':(s.fresh_us/1000).toFixed(2)+' ms';
+ liveFps=s.fills_per_s;liveWps=s.writes_per_s;
+ ampx.textContent='× '+Math.round(s.writes_per_s/Math.max(s.fills_per_s,1))+' write amplification';
  burststate.textContent=s.bursting?'BURSTING':'steady';
  document.getElementById('burst').className=s.bursting?'burston':'';
  sH.push(s.fills_per_s); wH.push(s.writes_per_s); pH.push(s.read_p99_ms);
