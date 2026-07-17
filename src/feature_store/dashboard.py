@@ -44,7 +44,7 @@ from fastapi.responses import HTMLResponse
 os.environ.setdefault("POLARS_MAX_THREADS", "2")
 
 from .config import KEYSPACE, make_cluster
-from .embeddings import coin_vector, wallet_vector
+from .embeddings import coin_vector, cosine, wallet_vector
 from .features import FeatureEngine
 from .replay import iter_fills
 from .scorer import unusual_accumulation
@@ -527,6 +527,78 @@ def similar(addr: str, k: int = 8):
     return out
 
 
+@app.get("/graph")
+def graph(k: int = 5, min_cos: float = 0.985):
+    """Behaviour-similarity network for the GRAPH tab: fan the ANN neighbour
+    lookup over the current whale/smart-money seeds and return nodes + edges.
+    Edges are behavioural links (trades alike), NOT counterparty flows."""
+    vps = _proc.get("vps")
+    if vps is None:
+        raise HTTPException(503, "vector schema not applied (just schema-vector)")
+    session, ps = _proc["session"], _proc["ps"]
+    with _lock:
+        seeds = dict(STATS.get("seeds") or {})
+    kinds: dict[str, str] = {}
+    for w in seeds.get("whales", []):
+        kinds[w["addr"]] = "whale"
+    for w in seeds.get("smart", []):
+        kinds[w["addr"]] = "both" if w["addr"] in kinds else "smart"
+
+    t0 = time.perf_counter()
+    nodes: dict[str, dict] = {}
+    edges: dict[frozenset, dict] = {}
+
+    def add_node(addr: str, row: dict, kind: str) -> None:
+        nodes.setdefault(addr, {"id": addr, "kind": kind}).update(
+            gross=row.get("gross_volume") or 0.0,
+            pnl=row.get("cum_realized_pnl") or 0.0,
+            arch=row.get("archetype") or "?",
+        )
+
+    for addr, kind in kinds.items():
+        srow = session.execute(ps["read_wallet"], (addr,)).one()
+        if not srow:
+            continue
+        srow = dict(srow._asdict())
+        emb = srow.pop("embedding", None)
+        if emb is None:
+            continue
+        seed_vec = list(emb)
+        add_node(addr, srow, kind)
+        tight = 0
+        for r in session.execute(vps["ann_wallets"], (seed_vec, k + 1)):
+            if r.addr == addr:
+                continue
+            nrow = session.execute(ps["read_wallet"], (r.addr,)).one()
+            if not nrow:
+                continue
+            nrow = dict(nrow._asdict())
+            nvec = nrow.pop("embedding", None)
+            if nvec is None:
+                continue
+            cos = cosine(seed_vec, list(nvec))
+            if cos < min_cos:
+                continue
+            if r.addr not in kinds:
+                add_node(r.addr, nrow, "neighbour")
+            edges[frozenset((addr, r.addr))] = {"a": addr, "b": r.addr,
+                                                "cos": round(cos, 4)}
+            if cos >= similarity.RING_COSINE:
+                tight += 1
+        if tight >= similarity.RING_MIN_NEIGHBOURS:
+            nodes[addr]["ring"] = True
+            for e in edges.values():
+                if addr in (e["a"], e["b"]) and e["cos"] >= similarity.RING_COSINE:
+                    other = e["b"] if e["a"] == addr else e["a"]
+                    if other in nodes:
+                        nodes[other]["ring"] = True
+    return {
+        "nodes": list(nodes.values()),
+        "edges": list(edges.values()),
+        "ms": round((time.perf_counter() - t0) * 1000, 1),
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML.replace("__SCYLLA__", _LOGO_SCYLLA).replace("__HL__", _LOGO_HL)
@@ -599,6 +671,7 @@ HTML = """
     <div class=tabs>
       <button id=tabLive class="tab on" onclick=showTab('live')>LIVE</button>
       <button id=tabSim class=tab onclick=showTab('sim')>SIMILAR WALLETS</button>
+      <button id=tabGraph class=tab onclick=showTab('graph')>GRAPH</button>
     </div>
     <button id=burst onclick=doBurst()>⚡ BURST</button>
     <span class=pill id=burststate>steady</span>
@@ -660,6 +733,19 @@ HTML = """
     <div class=row style=margin-top:10px><span class=sub id=simlat></span></div>
   </div>
 </div>
+<div class=grid id=tab-graph style=display:none>
+  <div class=card style=grid-column:1/3>
+    <div class=sub>Behaviour-similarity network
+      <span class=legend>wallets that trade alike (ANN neighbours, cosine ≥ 0.985) — behavioural links, not counterparty flows · new wallets join as the index picks them up</span></div>
+    <canvas id=gcanvas width=1130 height=560 style=cursor:pointer></canvas>
+    <div class=row>
+      <span class=sub id=glat></span>
+      <span class=legend><b style=color:#e4e4e7>●</b> whale &nbsp;<b style=color:#2bd6c6>●</b> smart money
+        &nbsp;<b style=color:#9be8df>●</b> both &nbsp;<b style=color:#71717a>●</b> neighbour
+        &nbsp;<b style=color:#ef5350>◦</b> ring-tight — click a node to inspect it</span>
+    </div>
+  </div>
+</div>
 <script>
 const sH=[],pH=[],wH=[];
 const sp=document.getElementById('spark'),sc=sp.getContext('2d');
@@ -699,12 +785,14 @@ function ampTick(t){
 requestAnimationFrame(ampTick);
 const COL={'directional':'#e4e4e7','mixed':'#71717a','market-maker':'#3f3f46'};
 // --- Similar-wallets tab -------------------------------------------------
-let simActive=false,selAddr=null;
-function showTab(t){simActive=(t=='sim');
- document.getElementById('tab-live').style.display=simActive?'none':'grid';
- document.getElementById('tab-sim').style.display=simActive?'grid':'none';
- tabLive.className='tab'+(simActive?'':' on');tabSim.className='tab'+(simActive?' on':'');
- if(simActive&&selAddr)fetchSim();}
+let curTab='live',simActive=false,selAddr=null;
+function showTab(t){curTab=t;simActive=(t=='sim');
+ for(const[id,btn]of[['tab-live',tabLive],['tab-sim',tabSim],['tab-graph',tabGraph]]){
+  const on=id=='tab-'+t;
+  document.getElementById(id).style.display=on?'grid':'none';
+  btn.className='tab'+(on?' on':'');}
+ if(t=='sim'&&selAddr)fetchSim();
+ if(t=='graph')fetchGraph();}
 function shorten(a){return a.length>14?a.slice(0,8)+'…'+a.slice(-4):a}
 function pnlFmt(p){const c=p>=0?'pos':'neg',s=p>=0?'+':'−';return `<b class=${c}>${s}$${fmt(Math.abs(p))}</b>`}
 function seedRows(el,list){el.innerHTML=(list||[]).map(w=>
@@ -734,11 +822,93 @@ function renderSim(d){const s=d.seed;
   ||'<span class=sub>no neighbours yet — the index is warming up</span>';
  simlat.textContent=`ANN ${d.ann_ms} ms · ${d.neighbours.length} feature point-reads ${d.point_reads_ms} ms — one CQL session`;}
 setInterval(()=>{if(simActive&&selAddr)fetchSim()},3000);
+// --- GRAPH tab: behaviour-similarity network ------------------------------
+const G={nodes:new Map(),edges:new Map(),ms:0};
+const gc=document.getElementById('gcanvas'),gx=gc.getContext('2d');
+const KCOL={whale:'#e4e4e7',smart:'#2bd6c6',both:'#9be8df',neighbour:'#71717a'};
+let hoverN=null;
+async function fetchGraph(){try{
+ const r=await fetch('/graph?k=5');if(!r.ok)return;
+ const d=await r.json();G.ms=d.ms;
+ const seen=new Set();
+ for(const n of d.nodes){seen.add(n.id);
+  let o=G.nodes.get(n.id);
+  if(!o){ // spawn near a linked node if we already know one, else near centre
+   let px=gc.width/2,py=gc.height/2;
+   const e=d.edges.find(e=>e.a==n.id||e.b==n.id);
+   if(e){const p=G.nodes.get(e.a==n.id?e.b:e.a);if(p){px=p.x;py=p.y;}}
+   o={x:px+(Math.random()-.5)*60,y:py+(Math.random()-.5)*60,vx:0,vy:0,a:0};
+   G.nodes.set(n.id,o);}
+  Object.assign(o,{id:n.id,kind:n.kind,gross:n.gross,pnl:n.pnl,arch:n.arch,ring:n.ring,gone:0});}
+ for(const[id,o]of G.nodes)if(!seen.has(id)&&++o.gone>2)G.nodes.delete(id);
+ const ek=new Set();
+ for(const e of d.edges){const k=e.a<e.b?e.a+'|'+e.b:e.b+'|'+e.a;ek.add(k);
+  const ex=G.edges.get(k);
+  if(ex)ex.cos=e.cos;else G.edges.set(k,{a:e.a,b:e.b,cos:e.cos,age:0});}
+ for(const k of G.edges.keys())if(!ek.has(k))G.edges.delete(k);
+}catch(err){}}
+setInterval(()=>{if(curTab=='graph')fetchGraph()},5000);
+function nodeR(n){return 3+Math.min(9,Math.log10(Math.max(n.gross||10,10)))}
+function gTick(){
+ if(curTab=='graph'){
+  const ns=[...G.nodes.values()];
+  for(let i=0;i<ns.length;i++){const p=ns[i];         // pairwise repulsion
+   for(let j=i+1;j<ns.length;j++){const q=ns[j];
+    let dx=p.x-q.x,dy=p.y-q.y;const d2=dx*dx+dy*dy+1,d=Math.sqrt(d2),f=1600/d2;
+    dx/=d;dy/=d;p.vx+=dx*f;p.vy+=dy*f;q.vx-=dx*f;q.vy-=dy*f;}}
+  for(const e of G.edges.values()){                    // springs: closer = more alike
+   const p=G.nodes.get(e.a),q=G.nodes.get(e.b);if(!p||!q)continue;
+   e.age++;
+   const rest=34+Math.max(0,(1-e.cos))*2600;
+   let dx=q.x-p.x,dy=q.y-p.y;const d=Math.sqrt(dx*dx+dy*dy)+.01,f=(d-rest)*0.02/d;
+   p.vx+=dx*f;p.vy+=dy*f;q.vx-=dx*f;q.vy-=dy*f;}
+  for(const p of ns){                                  // gravity + damping
+   p.vx+=(gc.width/2-p.x)*0.0015;p.vy+=(gc.height/2-p.y)*0.0015;
+   p.vx*=0.85;p.vy*=0.85;p.x+=p.vx;p.y+=p.vy;
+   p.a=Math.min(1,(p.a||0)+0.04);
+   p.x=Math.max(10,Math.min(gc.width-10,p.x));p.y=Math.max(10,Math.min(gc.height-10,p.y));}
+  drawGraph(ns);}
+ requestAnimationFrame(gTick);}
+requestAnimationFrame(gTick);
+function drawGraph(ns){gx.clearRect(0,0,gc.width,gc.height);
+ for(const e of G.edges.values()){
+  const p=G.nodes.get(e.a),q=G.nodes.get(e.b);if(!p||!q)continue;
+  const t=Math.min(1,Math.max(0,(e.cos-0.985)/0.015));
+  const al=Math.min(1,e.age/25)*(0.15+t*0.55);
+  gx.strokeStyle=(p.ring&&q.ring)?`rgba(239,83,80,${al})`:`rgba(43,214,198,${al})`;
+  gx.lineWidth=0.8+t*1.6;
+  gx.beginPath();gx.moveTo(p.x,p.y);gx.lineTo(q.x,q.y);gx.stroke();}
+ for(const n of ns){const r=nodeR(n);
+  gx.globalAlpha=n.a;
+  gx.fillStyle=KCOL[n.kind]||'#71717a';
+  gx.beginPath();gx.arc(n.x,n.y,r,0,7);gx.fill();
+  if(n.ring){gx.strokeStyle='#ef5350';gx.lineWidth=1.6;
+   gx.beginPath();gx.arc(n.x,n.y,r+2.5,0,7);gx.stroke();}
+  if(n.kind!='neighbour'){gx.fillStyle='#71717a';gx.font='10px ui-monospace,Menlo,monospace';
+   gx.fillText(n.id.slice(0,6)+'…'+n.id.slice(-4),n.x+r+4,n.y+3);}
+  gx.globalAlpha=1;}
+ if(hoverN){const n=hoverN,txt=`${n.id}  ·  ${n.arch}  ·  gross $${fmt(n.gross)}  ·  pnl ${n.pnl>=0?'+':'−'}$${fmt(Math.abs(n.pnl))}`;
+  gx.font='11px ui-monospace,Menlo,monospace';
+  const tw=gx.measureText(txt).width;
+  const tx=Math.min(n.x+12,gc.width-tw-16),ty=Math.max(n.y-14,16);
+  gx.fillStyle='rgba(19,19,22,.95)';gx.strokeStyle='#26262b';
+  gx.beginPath();gx.roundRect(tx-6,ty-12,tw+12,18,5);gx.fill();gx.stroke();
+  gx.fillStyle='#e4e4e7';gx.fillText(txt,tx,ty+1);}
+ glat.textContent=`${G.nodes.size} wallets · ${G.edges.size} links · graph rebuilt in ${G.ms} ms (ANN fan-out over the seeds)`;}
+function gHit(ev){const b=gc.getBoundingClientRect();
+ const mx=(ev.clientX-b.left)*gc.width/b.width,my=(ev.clientY-b.top)*gc.height/b.height;
+ let best=null,bd=144;
+ for(const n of G.nodes.values()){const dx=n.x-mx,dy=n.y-my,d=dx*dx+dy*dy;
+  if(d<bd){bd=d;best=n;}}
+ return best;}
+gc.addEventListener('mousemove',ev=>{hoverN=gHit(ev);gc.style.cursor=hoverN?'pointer':'default'});
+gc.addEventListener('mouseleave',()=>hoverN=null);
+gc.addEventListener('click',ev=>{const n=gHit(ev);if(n){pick(n.id);showTab('sim');}});
 const ws=new WebSocket('ws://'+location.host+'/ws');
 ws.onmessage=e=>{const s=JSON.parse(e.data);
  if(s.seeds&&simActive){seedRows(document.getElementById('whales'),s.seeds.whales);
   seedRows(document.getElementById('smart'),s.seeds.smart);}
- if(!s.vector_on)tabSim.style.display='none';
+ if(!s.vector_on){tabSim.style.display='none';tabGraph.style.display='none';}
  fps.innerHTML=fmt(s.fills_per_s)+'<span class=unit> fills/s</span>';
  wps.textContent=fmt(s.writes_per_s); ftot.textContent=s.fills_total.toLocaleString();
  card.textContent=s.active_coins+' / '+s.wallets.toLocaleString();
