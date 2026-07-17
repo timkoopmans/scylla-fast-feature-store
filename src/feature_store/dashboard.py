@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import datetime as dt
+import heapq
 import multiprocessing as mp
 import os
 import threading
@@ -35,7 +36,7 @@ import time
 from collections import deque
 from datetime import timezone
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import HTMLResponse
 
 # Cap polars threads — the ingest and the write-blaster procs read parquet; set
@@ -43,11 +44,13 @@ from fastapi.responses import HTMLResponse
 os.environ.setdefault("POLARS_MAX_THREADS", "2")
 
 from .config import KEYSPACE, make_cluster
+from .embeddings import coin_vector, wallet_vector
 from .features import FeatureEngine
 from .replay import iter_fills
 from .scorer import unusual_accumulation
-from .statements import prepare_all
+from .statements import prepare_all, prepare_vector
 from .writer import Pipeline
+from . import similarity
 
 UTC = timezone.utc
 SPEED = float(os.environ.get("FS_SPEED", "30"))
@@ -63,6 +66,8 @@ BURST_SECS = float(os.environ.get("FS_BURST_SECS", "15"))
 BLASTERS = int(os.environ.get("FS_BLASTERS", "0"))
 BURST_BLASTERS = int(os.environ.get("FS_BURST_BLASTERS", "0"))
 BLAST_INFLIGHT = int(os.environ.get("FS_BLAST_INFLIGHT", "2048"))
+# behaviour-embedding flush cadence (webinar 2); only dirty wallets are written
+EMB_FLUSH_SECS = float(os.environ.get("FS_EMB_FLUSH_SECS", "2.0"))
 
 app = FastAPI(title="ScyllaDB feature store — live")
 
@@ -94,6 +99,8 @@ STATS = {
     "hot": [],
     "arch": {},
     "bursting": False,
+    "seeds": {},
+    "vector_on": False,
 }
 _lock = threading.Lock()
 _proc = {}
@@ -117,14 +124,16 @@ def _ingest_proc(shared, base_speed, days, profile):
     except Exception:
         pass
     ps = prepare_all(session)
+    vps = prepare_vector(session)  # None until cql/schema_vector.cql is applied
     pipe = Pipeline(session, max_inflight=2048)
     now0 = time.monotonic()
-    last_t = last_flush = last_speedchk = now0
+    last_t = last_flush = last_speedchk = last_emb = now0
     last_fills = last_writes = 0
     n = 0
     next_emit = now0
     prev_ts = None
     eff_speed = base_speed
+    dirty: set[str] = set()   # wallets touched since the last embedding flush
 
     def flush_open():
         for coin, win, snap in engine.open_snapshots():
@@ -144,6 +153,27 @@ def _ingest_proc(shared, base_speed, days, profile):
                     snap["smart_flow"],
                 ),
             )
+
+    def flush_embeddings():
+        # wallet features + behaviour vector in ONE upsert (one CDC row image
+        # carrying the vector -> the ANN index refreshes); dirty wallets only,
+        # so the extra write load tracks activity, not population size.
+        for addr in dirty:
+            w = engine.wallets.get(addr)
+            if w is None:
+                continue
+            pipe.execute(vps["wallet_vec"], (
+                addr, w.cum_realized_pnl, w.total_fills, w.gross_volume,
+                abs(w.signed_volume), w.churn, w.archetype, _ts(w.last_ts),
+                wallet_vector(w),
+            ))
+        dirty.clear()
+        coin_snaps: dict[str, dict[str, dict]] = {}
+        for coin, win, snap in engine.open_snapshots():
+            coin_snaps.setdefault(coin, {})[win] = snap
+        now_utc = dt.datetime.now(UTC)
+        for coin, snaps in coin_snaps.items():
+            pipe.execute(vps["coin_flow"], (coin, coin_vector(snaps), now_utc))
 
     for f in iter_fills(limit_days=days):
         now = time.monotonic()
@@ -167,6 +197,8 @@ def _ingest_proc(shared, base_speed, days, profile):
         prev_ts = f.ts_ms
 
         wc, w, closed = engine.apply(f)
+        if vps:
+            dirty.add(f.addr)
         pipe.execute(
             ps["wallet_coin"],
             (
@@ -201,6 +233,9 @@ def _ingest_proc(shared, base_speed, days, profile):
         if now - last_flush >= 0.25:
             flush_open()
             last_flush = now
+        if vps and now - last_emb >= EMB_FLUSH_SECS:
+            flush_embeddings()
+            last_emb = now
         if now - last_t >= 0.5:
             dt_s = now - last_t
             hot = sorted(
@@ -214,6 +249,32 @@ def _ingest_proc(shared, base_speed, days, profile):
             arch = {"market-maker": 0, "directional": 0, "mixed": 0}
             for ws in engine.wallets.values():
                 arch[ws.archetype] = arch.get(ws.archetype, 0) + 1
+            # seed candidates for the Similar-wallets tab: biggest wallets by
+            # gross notional ("whales") and profitable directional wallets
+            # ("smart money") — the two lenses the ANN demo starts from.
+            whales = heapq.nlargest(
+                8, engine.wallets.items(), key=lambda kv: kv[1].gross_volume
+            )
+            smart = heapq.nlargest(
+                8,
+                (
+                    kv for kv in engine.wallets.items()
+                    if kv[1].archetype == "directional" and kv[1].cum_realized_pnl > 0
+                ),
+                key=lambda kv: kv[1].cum_realized_pnl,
+            )
+            shared["seeds"] = {
+                grp: [
+                    {
+                        "addr": a,
+                        "gross": ws_.gross_volume,
+                        "pnl": ws_.cum_realized_pnl,
+                        "arch": ws_.archetype,
+                    }
+                    for a, ws_ in lst
+                ]
+                for grp, lst in (("whales", whales), ("smart", smart))
+            }
             shared["fills_total"] = n
             shared["writes_total"] = pipe.count
             shared["fills_per_s"] = (n - last_fills) / dt_s
@@ -378,6 +439,8 @@ def _reader_thread(shared):
             STATS["wallets"] = snap.get("wallets", 0)
             STATS["active_coins"] = snap.get("active_coins", 0)
             STATS["arch"] = dict(snap.get("arch", {}))
+            STATS["seeds"] = dict(snap.get("seeds", {}))
+            STATS["vector_on"] = _proc.get("vps") is not None
             STATS["bursting"] = bool(snap.get("bursting", False))
             STATS["fresh_us"] = round(fresh_us, 1)
             dm = snap.get("data_time_ms")
@@ -415,6 +478,14 @@ def _startup():
         b.start()
         blasters.append(b)
     _proc.update(on=True, p=p, blasters=blasters, mgr=mgr, shared=shared)
+    # web-process session for the on-demand similarity endpoint (the reader
+    # thread keeps its own; driver sessions are thread-safe either way)
+    cluster = make_cluster(PROFILE, "tuned")
+    session = cluster.connect(KEYSPACE)
+    _proc["cluster"] = cluster
+    _proc["session"] = session
+    _proc["ps"] = prepare_all(session)
+    _proc["vps"] = prepare_vector(session)
     time.sleep(1.5)
     threading.Thread(target=_reader_thread, args=(shared,), daemon=True).start()
 
@@ -426,6 +497,9 @@ def _shutdown():
         b.terminate()
     if _proc.get("p"):
         _proc["p"].terminate()
+    if _proc.get("session"):
+        _proc["session"].shutdown()
+        _proc["cluster"].shutdown()
 
 
 @app.post("/burst")
@@ -439,6 +513,18 @@ def burst(secs: float = BURST_SECS):
 def stats():
     with _lock:
         return dict(STATS)
+
+
+@app.get("/similar/{addr}")
+def similar(addr: str, k: int = 8):
+    """ANN neighbours + feature point-reads for the Similar-wallets tab."""
+    vps = _proc.get("vps")
+    if vps is None:
+        raise HTTPException(503, "vector schema not applied (just schema-vector)")
+    out = similarity.similar_wallets(_proc["session"], _proc["ps"], vps, addr, k)
+    if out is None:
+        raise HTTPException(404, "no embedding for this wallet yet")
+    return out
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -485,6 +571,23 @@ HTML = """
  .ampx{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:12px;
        font-weight:700;color:var(--mut);background:var(--card);border:1px solid var(--bd);
        border-radius:6px;padding:2px 10px;white-space:nowrap}
+ .tabs{display:flex;gap:8px}
+ .tab{background:transparent;color:var(--mut);border:1px solid var(--bd);border-radius:8px;
+      padding:7px 14px;font-weight:700;cursor:pointer;font-size:13px;letter-spacing:.3px}
+ .tab.on{background:var(--fg);color:var(--bg);border-color:var(--fg)}
+ .tab:hover{filter:brightness(1.2)}
+ .addr{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+ .seedrow{cursor:pointer;border-radius:6px;padding:3px 6px;margin:2px -6px}
+ .seedrow:hover{background:var(--dim)} .seedrow.sel{outline:1px solid var(--fg)}
+ .cosbar{height:8px;background:var(--dim);border-radius:3px}
+ .cosfill{height:8px;background:#2bd6c6;border-radius:3px}
+ .ring{background:rgba(239,83,80,.12);border:1px solid var(--dn);border-radius:8px;
+       padding:8px 12px;margin:10px 0;font-weight:600;font-size:12px}
+ .whychip{display:inline-block;font-size:10px;color:var(--mut);border:1px solid var(--bd);
+          border-radius:4px;padding:1px 5px;margin-right:4px}
+ .pos{color:var(--up)}.neg{color:var(--dn)}
+ input.waddr{background:var(--bg);border:1px solid var(--bd);border-radius:8px;color:var(--fg);
+             padding:7px 10px;width:100%;font-family:ui-monospace,Menlo,monospace;font-size:12px}
 </style></head><body>
 <header>
   <div class=brand>
@@ -493,11 +596,15 @@ HTML = """
     <span class=title>ScyllaDB + Hyperliquid Feature Store <b></span>
   </div>
   <div class=ctl>
+    <div class=tabs>
+      <button id=tabLive class="tab on" onclick=showTab('live')>LIVE</button>
+      <button id=tabSim class=tab onclick=showTab('sim')>SIMILAR WALLETS</button>
+    </div>
     <button id=burst onclick=doBurst()>⚡ BURST</button>
     <span class=pill id=burststate>steady</span>
   </div>
 </header>
-<div class=grid>
+<div class=grid id=tab-live>
   <div class=card>
     <div class=sub>Hyperliquid Validator</div>
     <div class=big id=fps>0<span class=unit> fills/s</span></div>
@@ -531,6 +638,26 @@ HTML = """
     <div class=sub>Wallet archetype mix</div>
     <div id=archbar style=margin:8px 0></div>
     <div id=archlegend></div>
+  </div>
+</div>
+<div class=grid id=tab-sim style=display:none>
+  <div class=card>
+    <div class=sub>Pick a wallet — behaviour neighbours via ANN, same engine</div>
+    <div style=margin:10px 0>
+      <input class=waddr id=waddr placeholder="paste a wallet address…"
+             onkeydown="if(event.key=='Enter')pick(this.value.trim())">
+    </div>
+    <div class=sub style=margin-top:12px>🐋 whales — largest gross volume</div>
+    <div id=whales></div>
+    <div class=sub style=margin-top:12px>🧠 smart money — profitable + directional</div>
+    <div id=smart></div>
+  </div>
+  <div class=card>
+    <div class=sub>Nearest wallets <span class=legend>ORDER BY embedding ANN OF &lt;seed&gt; · refreshed every 3s while the firehose runs</span></div>
+    <div id=simseed style=margin:10px 0></div>
+    <div id=simring></div>
+    <div id=simout><span class=sub>select a wallet on the left</span></div>
+    <div class=row style=margin-top:10px><span class=sub id=simlat></span></div>
   </div>
 </div>
 <script>
@@ -571,8 +698,47 @@ function ampTick(t){
  requestAnimationFrame(ampTick);}
 requestAnimationFrame(ampTick);
 const COL={'directional':'#e4e4e7','mixed':'#71717a','market-maker':'#3f3f46'};
+// --- Similar-wallets tab -------------------------------------------------
+let simActive=false,selAddr=null;
+function showTab(t){simActive=(t=='sim');
+ document.getElementById('tab-live').style.display=simActive?'none':'grid';
+ document.getElementById('tab-sim').style.display=simActive?'grid':'none';
+ tabLive.className='tab'+(simActive?'':' on');tabSim.className='tab'+(simActive?' on':'');
+ if(simActive&&selAddr)fetchSim();}
+function shorten(a){return a.length>14?a.slice(0,8)+'…'+a.slice(-4):a}
+function pnlFmt(p){const c=p>=0?'pos':'neg',s=p>=0?'+':'−';return `<b class=${c}>${s}$${fmt(Math.abs(p))}</b>`}
+function seedRows(el,list){el.innerHTML=(list||[]).map(w=>
+ `<div class="seedrow row${w.addr==selAddr?' sel':''}" onclick="pick('${w.addr}')" title="${w.addr}">`+
+ `<span class=addr>${shorten(w.addr)}</span><span class=sub>${w.arch}</span>`+
+ `<span style=width:120px;text-align:right>$${fmt(w.gross)} · ${pnlFmt(w.pnl)}</span></div>`).join('')
+ ||'<span class=sub>warming up…</span>';}
+function pick(a){if(!a)return;selAddr=a;waddr.value=a;fetchSim();}
+async function fetchSim(){if(!selAddr)return;
+ try{const r=await fetch('/similar/'+selAddr+'?k=8');
+  if(!r.ok){simout.innerHTML=`<span class=sub>${(await r.json()).detail||r.status}</span>`;simseed.innerHTML='';simring.innerHTML='';return;}
+  renderSim(await r.json());}catch(e){}}
+function renderSim(d){const s=d.seed;
+ simseed.innerHTML=`<span class=addr title="${s.addr}"><b>${shorten(s.addr)}</b></span> `+
+  `<span class=pill>${s.archetype}</span> <span class=sub>gross</span> $${fmt(s.gross_volume)} `+
+  `<span class=sub>pnl</span> ${pnlFmt(s.cum_realized_pnl)} <span class=sub>fills</span> ${s.total_fills.toLocaleString()}`;
+ simring.innerHTML=d.ring_suspect?`<div class=ring>⚠ ${d.ring_size} near-identical neighbours (cosine ≥ 0.995) — possible coordinated ring / wash-trading cluster</div>`:'';
+ simout.innerHTML=d.neighbours.map(n=>{const cw=Math.max(0,(n.cosine-0.9)/0.1)*100;
+  const why=(n.why&&n.why.most_alike||[]).map(w=>`<span class=whychip>${w.dim}</span>`).join('');
+  return `<div class=row title="${n.addr}">`+
+   `<span class=addr style=width:110px>${shorten(n.addr)}</span>`+
+   `<div style=flex:1;margin:0 10px><div class=cosbar><div class=cosfill style=width:${cw}%></div></div></div>`+
+   `<span class=score style=width:52px>${n.cosine.toFixed(4)}</span>`+
+   `<span class=sub style=width:90px;text-align:right>${n.archetype}</span>`+
+   `<span style=width:90px;text-align:right>${pnlFmt(n.cum_realized_pnl)}</span>`+
+   `</div><div style=margin:-2px 0 6px 0>${why}</div>`}).join('')
+  ||'<span class=sub>no neighbours yet — the index is warming up</span>';
+ simlat.textContent=`ANN ${d.ann_ms} ms · ${d.neighbours.length} feature point-reads ${d.point_reads_ms} ms — one CQL session`;}
+setInterval(()=>{if(simActive&&selAddr)fetchSim()},3000);
 const ws=new WebSocket('ws://'+location.host+'/ws');
 ws.onmessage=e=>{const s=JSON.parse(e.data);
+ if(s.seeds&&simActive){seedRows(document.getElementById('whales'),s.seeds.whales);
+  seedRows(document.getElementById('smart'),s.seeds.smart);}
+ if(!s.vector_on)tabSim.style.display='none';
  fps.innerHTML=fmt(s.fills_per_s)+'<span class=unit> fills/s</span>';
  wps.textContent=fmt(s.writes_per_s); ftot.textContent=s.fills_total.toLocaleString();
  card.textContent=s.active_coins+' / '+s.wallets.toLocaleString();
