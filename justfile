@@ -60,6 +60,12 @@ local-down:
 local-nuke:
     docker compose -f docker/docker-compose.local.yml -p fslocal down -v
 
+# live dashboard against the local single node (blasters off — light load)
+local-dashboard speed="50" days="1":
+    FS_CONTACT_POINTS=127.0.0.1 FS_SPEED={{ speed }} FS_DAYS={{ days }} \
+        FS_BLASTERS=0 FS_BURST_BLASTERS=0 \
+        {{ py }} -m uvicorn --app-dir src feature_store.dashboard:app --host 127.0.0.1 --port 8090
+
 # schema + light ingest + ANN smoke against the local single node
 local-demo fills="200000":
     FS_CONTACT_POINTS=127.0.0.1 just schema
