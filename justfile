@@ -11,7 +11,7 @@
 py := ".venv/bin/python"
 host := env_var_or_default("FS_HOST", "localhost")
 # remote demo host for the cloud dashboard/tunnel recipes, e.g. FS_REMOTE=ubuntu@1.2.3.4
-remote := env_var_or_default("FS_REMOTE", "ubuntu@13.218.65.67")
+remote := env_var_or_default("FS_REMOTE", "ubuntu@32.197.64.184")
 rdir := env_var_or_default("FS_REMOTE_DIR", "scylla-fast-feature-store")
 
 export PYTHONPATH := "src"

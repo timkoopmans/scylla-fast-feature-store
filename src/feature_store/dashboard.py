@@ -520,12 +520,11 @@ HTML = """
     <span class=ampx id=ampx>× —</span>
   </div>
   <div class=card>
-    <div class=sub>Write load by coin — the skew that drives partition-key design</div>
+    <div class=sub>Write load by coin</div>
     <div id=hot></div>
   </div>
   <div class=card>
     <div class=sub>Cross-ticker signal board</div>
-    <div class=legend style=margin:2px 0 8px>smart-money flow (sell ◀ ▶ buy) · accumulation score · action</div>
     <div id=board></div>
   </div>
   <div class=card style=grid-column:1/3>
