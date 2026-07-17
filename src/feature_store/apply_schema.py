@@ -8,6 +8,8 @@ import argparse
 import os
 import re
 
+from cassandra import InvalidRequest
+
 from .config import make_cluster
 
 
@@ -47,7 +49,14 @@ def main():
     for stmt in split_statements(text):
         head = " ".join(stmt.split()[:4])
         print(f"-> {head} ...")
-        session.execute(stmt)
+        try:
+            session.execute(stmt)
+        except InvalidRequest as e:
+            # ALTER TABLE ... ADD has no IF NOT EXISTS; tolerate re-runs.
+            if "already" in str(e).lower() or "conflicts" in str(e).lower():
+                print(f"   (skipped: {e})")
+            else:
+                raise
     print("schema applied.")
     session.shutdown()
     cluster.shutdown()

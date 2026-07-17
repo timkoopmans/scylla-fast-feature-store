@@ -12,8 +12,8 @@ import time
 from fastapi import FastAPI, HTTPException
 
 from .config import make_cluster, KEYSPACE
-from .statements import prepare_all
-from . import scorer
+from .statements import prepare_all, prepare_vector
+from . import scorer, similarity
 
 app = FastAPI(title="ScyllaDB feature store — inference")
 
@@ -29,6 +29,7 @@ def _startup():
     _state["cluster"] = cluster
     _state["session"] = session
     _state["ps"] = prepare_all(session)
+    _state["vps"] = prepare_vector(session)  # None until schema_vector.cql applied
 
 
 @app.on_event("shutdown")
@@ -81,6 +82,31 @@ def wallet_coin(addr: str, coin: str):
     if not row:
         raise HTTPException(404, "no features for (wallet, coin)")
     return {"db_read_ms": round(db_ms, 3), **row}
+
+
+# --- webinar 2: similarity endpoints (ANN + point-reads, one engine) ---------
+
+def _vps():
+    vps = _state.get("vps")
+    if vps is None:
+        raise HTTPException(503, "vector schema not applied (just schema-vector)")
+    return vps
+
+
+@app.get("/similar/wallet/{addr}")
+def similar_wallet(addr: str, k: int = 10):
+    out = similarity.similar_wallets(_state["session"], _state["ps"], _vps(), addr, k)
+    if out is None:
+        raise HTTPException(404, "no embedding for wallet (consumer not run yet?)")
+    return out
+
+
+@app.get("/similar/coin/{coin}")
+def similar_coin(coin: str, k: int = 5):
+    out = similarity.similar_coins(_state["session"], _state["ps"], _vps(), coin, k)
+    if out is None:
+        raise HTTPException(404, "no flow vector for coin")
+    return out
 
 
 def _env(k, d):

@@ -74,6 +74,11 @@ class WalletState:
     opens: int = 0
     closes: int = 0
     last_ts: int = 0
+    # inputs to the behaviour embedding (webinar 2)
+    taker_buy_vol: float = 0.0
+    taker_sell_vol: float = 0.0
+    coin_gross: dict = field(default_factory=dict)      # coin -> gross notional
+    hours: list = field(default_factory=lambda: [0] * 24)  # UTC hour histogram
 
     def update(self, f: Fill) -> None:
         notional = f.notional
@@ -83,8 +88,14 @@ class WalletState:
         self.signed_volume += notional if f.is_buy else -notional
         if f.crossed:
             self.opens += 1      # taker = aggressive entry/exit
+            if f.is_buy:
+                self.taker_buy_vol += notional
+            else:
+                self.taker_sell_vol += notional
         else:
             self.closes += 1     # maker = passive / providing liquidity
+        self.coin_gross[f.coin] = self.coin_gross.get(f.coin, 0.0) + notional
+        self.hours[(f.ts_ms // 3_600_000) % 24] += 1
         self.last_ts = f.ts_ms
 
     @property

@@ -1,5 +1,6 @@
-# Webinar 1 — fast feature store on ScyllaDB.
+# Webinars 1+2 — fast feature store + vector search on ScyllaDB.
 # Run these on the demo host (Docker + dataset + venv live there).
+# `local-*` recipes run on a laptop against docker/docker-compose.local.yml.
 #   just            # list recipes
 #   just setup cluster-up schema demo
 #
@@ -46,11 +47,41 @@ cluster-nuke:
 schema:
     {{ py }} -m feature_store.apply_schema --schema cql/schema.cql
 
+# apply the webinar-2 vector additions (embedding columns + ANN indexes)
+schema-vector:
+    {{ py }} -m feature_store.apply_schema --schema cql/schema_vector.cql
+
+# --- local laptop cluster (single node + vector store, LIGHT LOAD ONLY) ----
+# the real webinar runs on ScyllaDB Cloud; this is for iterating on a Mac
+local-up:
+    docker compose -f docker/docker-compose.local.yml -p fslocal up -d --wait
+local-down:
+    docker compose -f docker/docker-compose.local.yml -p fslocal down
+local-nuke:
+    docker compose -f docker/docker-compose.local.yml -p fslocal down -v
+
+# schema + light ingest + ANN smoke against the local single node
+local-demo fills="200000":
+    FS_CONTACT_POINTS=127.0.0.1 just schema
+    FS_CONTACT_POINTS=127.0.0.1 just schema-vector
+    FS_CONTACT_POINTS=127.0.0.1 {{ py }} -m feature_store.consumer \
+        --speed 0 --days 1 --max-fills {{ fills }} --max-inflight 512
+    FS_CONTACT_POINTS=127.0.0.1 {{ py }} -m feature_store.similarity smoke
+
 # --- pipeline -------------------------------------------------------------
 # stream fills -> features -> ScyllaDB. speed=0 is max; writes sample_keys.csv
 consume days="1" speed="0" raw_sink="off":
     {{ py }} -m feature_store.consumer --speed {{ speed }} --days {{ days }} \
         --raw-sink {{ raw_sink }} --sample-out sample_keys.csv
+
+# --- webinar 2: similarity ---------------------------------------------------
+# k nearest wallets by behaviour (ANN) + their live features (point-reads)
+similar mode id k="10":
+    {{ py }} -m feature_store.similarity {{ mode }} {{ id }} --k {{ k }}
+
+# end-to-end ANN sanity check (needs consumer to have run with embeddings on)
+similar-smoke:
+    {{ py }} -m feature_store.similarity smoke
 
 # --- benchmarks -----------------------------------------------------------
 # inference point-read latency

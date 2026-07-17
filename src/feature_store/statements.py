@@ -36,6 +36,29 @@ READ_COIN_WINDOW_LATEST = (
 )
 READ_WALLET = "SELECT * FROM wallet_features WHERE addr=?"
 
+# --- webinar 2: vector search (requires cql/schema_vector.cql) ---------------
+# The embedding is written IN THE SAME upsert as the features: one mutation ->
+# one CDC row image that always carries the vector (the Vector Store skips CDC
+# rows without one), and half the writes vs a separate SET embedding UPDATE.
+UPSERT_WALLET_VEC = """
+INSERT INTO wallet_features
+  (addr, cum_realized_pnl, total_fills, gross_volume, net_volume, churn, archetype, last_ts, embedding)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
+UPSERT_COIN_FLOW = """
+INSERT INTO coin_flow_vectors (coin, embedding, updated_ts) VALUES (?, ?, ?)
+"""
+
+# The whole webinar in two statements: an ANN neighbour lookup and the same
+# point-read the feature store already serves — one engine, two query types.
+ANN_WALLETS = (
+    "SELECT addr FROM wallet_features ORDER BY embedding ANN OF ? LIMIT ?"
+)
+ANN_COINS = (
+    "SELECT coin FROM coin_flow_vectors ORDER BY embedding ANN OF ? LIMIT ?"
+)
+READ_COIN_FLOW = "SELECT * FROM coin_flow_vectors WHERE coin=?"
+
 
 def prepare_all(session) -> dict:
     return {
@@ -48,3 +71,20 @@ def prepare_all(session) -> dict:
         "read_coin_window": session.prepare(READ_COIN_WINDOW_LATEST),
         "read_wallet": session.prepare(READ_WALLET),
     }
+
+
+def prepare_vector(session) -> dict | None:
+    """Prepare the vector statements; None if schema_vector.cql isn't applied
+    (keeps the webinar-1 pipeline runnable against a vector-less cluster)."""
+    from cassandra import InvalidRequest
+
+    try:
+        return {
+            "wallet_vec": session.prepare(UPSERT_WALLET_VEC),
+            "coin_flow": session.prepare(UPSERT_COIN_FLOW),
+            "ann_wallets": session.prepare(ANN_WALLETS),
+            "ann_coins": session.prepare(ANN_COINS),
+            "read_coin_flow": session.prepare(READ_COIN_FLOW),
+        }
+    except InvalidRequest:
+        return None
