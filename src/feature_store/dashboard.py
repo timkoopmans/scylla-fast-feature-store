@@ -45,7 +45,7 @@ os.environ.setdefault("POLARS_MAX_THREADS", "2")
 
 from .config import KEYSPACE, make_cluster
 from .embeddings import coin_vector, cosine, wallet_vector
-from .features import FeatureEngine
+from .features import FeatureEngine, WalletState
 from .replay import iter_fills
 from .scorer import unusual_accumulation
 from .statements import prepare_all, prepare_vector
@@ -68,6 +68,15 @@ BURST_BLASTERS = int(os.environ.get("FS_BURST_BLASTERS", "0"))
 BLAST_INFLIGHT = int(os.environ.get("FS_BLAST_INFLIGHT", "2048"))
 # behaviour-embedding flush cadence (webinar 2); only dirty wallets are written
 EMB_FLUSH_SECS = float(os.environ.get("FS_EMB_FLUSH_SECS", "2.0"))
+# How many of the blasters also write behaviour vectors (webinar 2). A plain
+# blaster only upserts wallet_coin_features, which never reaches the vector
+# index — so with 0 here the whole write fleet leaves the ANN index idle. An
+# embedding blaster maintains its own WalletState and re-upserts wallet_features
+# WITH the vector, producing the CDC row images the Vector Store re-indexes.
+# Costlier per write than a plain blaster: that re-index cost is the point.
+BLAST_EMBED = int(os.environ.get("FS_BLAST_EMBED", "0"))
+# fills between embedding flushes inside an embedding blaster
+BLAST_EMB_EVERY = int(os.environ.get("FS_BLAST_EMB_EVERY", "20000"))
 
 app = FastAPI(title="ScyllaDB feature store — live")
 
@@ -295,12 +304,16 @@ def _ingest_proc(shared, base_speed, days, profile):
 # --------------------------------------------------------------------------- #
 # write-blaster process — sustains real write load to ScyllaDB
 # --------------------------------------------------------------------------- #
-def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
+def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared,
+                  embed=False):
     import polars as pl
 
-    from .replay import COLUMNS, day_files
+    from .replay import COLUMNS, Fill, day_files
 
-    # this worker's even share of fills (stride by index), loaded once
+    # this worker's even share of fills (stride by index), loaded once.
+    # Embedding blasters keep the raw side/taker/timestamp fields too — they
+    # need a real Fill to drive WalletState, and a wrong vector would poison
+    # the neighbour lists the demo shows.
     rows = []
     gi = 0
     for path in day_files(days):
@@ -308,20 +321,24 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
         for addr, coin, px, sz, side, t, cpnl, crossed in df.iter_rows():
             if gi % nblast == wid:
                 net = sz if side == "B" else -sz
-                rows.append(
-                    (
-                        addr,
-                        coin,
-                        net,
-                        px,
-                        (cpnl or 0.0),
-                        dt.datetime.fromtimestamp(t / 1000.0, tz=UTC),
-                    )
+                row = (
+                    addr,
+                    coin,
+                    net,
+                    px,
+                    (cpnl or 0.0),
+                    dt.datetime.fromtimestamp(t / 1000.0, tz=UTC),
                 )
+                rows.append(row + (sz, side, t, bool(crossed)) if embed else row)
             gi += 1
     cluster = make_cluster(profile, "tuned")
     session = cluster.connect(KEYSPACE)
     stmt = prepare_all(session)["wallet_coin"]
+    vps = prepare_vector(session) if embed else None
+    if embed and vps is None:
+        embed = False   # vector schema absent: degrade to a plain blaster
+    states: dict = {}
+    dirty: set[str] = set()
     pipe = Pipeline(session, max_inflight=max_inflight, sample_every=4096)
     key = f"bw_{wid}"
     BATCH = 1024
@@ -340,9 +357,28 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared):
                 last_chk = now
             shared[key] = pipe.count
             continue
-        for addr, coin, net, px, cpnl, ts in rows:
+        for row in rows:
+            addr, coin, net, px, cpnl, ts = row[:6]
             fc += 1
             pipe.execute(stmt, (addr, coin, net, px, cpnl, fc, ts))
+            if embed:
+                sz, side, t_ms, crossed = row[6:]
+                w = states.get(addr)
+                if w is None:
+                    w = states[addr] = WalletState()
+                w.update(Fill(addr, coin, px, sz, side, t_ms, cpnl, crossed))
+                dirty.add(addr)
+                if fc % BLAST_EMB_EVERY == 0:
+                    # one upsert carrying features + vector -> one CDC row
+                    # image the Vector Store picks up (see UPSERT_WALLET_VEC)
+                    for a in dirty:
+                        s = states[a]
+                        pipe.execute(vps["wallet_vec"], (
+                            a, s.cum_realized_pnl, s.total_fills, s.gross_volume,
+                            abs(s.signed_volume), s.churn, s.archetype,
+                            _ts(s.last_ts), wallet_vector(s),
+                        ))
+                    dirty.clear()
             if fc % BATCH == 0:
                 now = time.monotonic()
                 if now - last_chk >= 0.25:
@@ -470,9 +506,12 @@ def _startup():
     blasters = []
     for w in range(total_b):
         burst_only = w >= BLASTERS
+        # the first FS_BLAST_EMBED baseline workers also write vectors, so the
+        # vector index sees sustained CDC re-index load alongside the raw writes
         b = ctx.Process(
             target=_blaster_proc,
-            args=(w, total_b, DAYS, PROFILE, BLAST_INFLIGHT, burst_only, shared),
+            args=(w, total_b, DAYS, PROFILE, BLAST_INFLIGHT, burst_only, shared,
+                  w < BLAST_EMBED),
             daemon=True,
         )
         b.start()

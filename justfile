@@ -102,6 +102,12 @@ bench-compare:
     @just bench tuning=tuned
     @just bench tuning=default
 
+# ANN query load + latency against the vector index (webinar 2). Same client
+# shape as `bench`, so the ANN p99 and the point-read p99 are comparable.
+bench-ann n="200000" procs="12" threads="8" k="10" seeds="5000":
+    {{ py }} -m feature_store.bench ann --n {{ n }} --procs {{ procs }} \
+        --threads {{ threads }} --k {{ k }} --seeds {{ seeds }}
+
 # write-throughput ceiling (multi-process loadgen)
 loadgen procs="12" days="1" tuning="tuned":
     {{ py }} -m feature_store.loadgen --procs {{ procs }} --days {{ days }} --tuning {{ tuning }}
@@ -147,7 +153,9 @@ cloud-schema:
 # launch the live dashboard on the remote host against ScyllaDB Cloud (detached).
 # assumes the repo + .venv + ~/.fs-cloud.env are already set up on the remote.
 # blasters: background write-load procs (24 is the sweet spot on a 48-vCPU box).
-cloud-dashboard blasters="24" burst_blasters="16" speed="10" days="1":
+# embed: how many baseline blasters ALSO write behaviour vectors — plain
+# blasters never touch the vector index, so leave this >0 for webinar 2.
+cloud-dashboard blasters="24" burst_blasters="16" speed="10" days="1" embed="6":
     #!/usr/bin/env bash
     set -euo pipefail
     [ -n "{{ remote }}" ] || { echo "set FS_REMOTE=user@host first"; exit 1; }
@@ -157,11 +165,17 @@ cloud-dashboard blasters="24" burst_blasters="16" speed="10" days="1":
     else
       ssh {{ remote }} "cd {{ rdir }} && source ~/.fs-cloud.env && \
         FS_SPEED={{ speed }} FS_DAYS={{ days }} FS_BLASTERS={{ blasters }} \
-        FS_BURST_BLASTERS={{ burst_blasters }} PYTHONPATH=src \
+        FS_BURST_BLASTERS={{ burst_blasters }} FS_BLAST_EMBED={{ embed }} PYTHONPATH=src \
         nohup .venv/bin/python -m uvicorn --app-dir src feature_store.dashboard:app \
         --host 0.0.0.0 --port 8090 >/tmp/fs-dashboard.log 2>&1 & sleep 1; echo launched"
-      echo "starting on {{ remote }}:8090 (baseline {{ blasters }} + {{ burst_blasters }} burst blasters)"
+      echo "starting on {{ remote }}:8090 (baseline {{ blasters }} + {{ burst_blasters }} burst, {{ embed }} embedding)"
     fi
+
+# ANN query load against Cloud, driven from the remote demo host
+cloud-bench-ann n="200000" procs="12" threads="8" k="10":
+    ssh {{ remote }} "cd {{ rdir }} && source ~/.fs-cloud.env && \
+        PYTHONPATH=src .venv/bin/python -m feature_store.bench ann \
+        --n {{ n }} --procs {{ procs }} --threads {{ threads }} --k {{ k }}"
 
 # force a restart (kill + relaunch) — use to change blasters/speed/days
 cloud-dashboard-restart blasters="24" burst_blasters="16" speed="0" days="1":
