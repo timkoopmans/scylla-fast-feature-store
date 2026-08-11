@@ -50,7 +50,7 @@ from .replay import iter_fills
 from .scorer import unusual_accumulation
 from .statements import prepare_all, prepare_vector
 from .writer import Pipeline
-from . import similarity
+from . import cloudmetrics, similarity
 
 UTC = timezone.utc
 SPEED = float(os.environ.get("FS_SPEED", "30"))
@@ -88,6 +88,11 @@ ANN_K = int(os.environ.get("FS_ANN_K", "10"))
 # Which ANN index the probers search: "wallet-coin" (981k vectors, the realistic
 # population) or "wallet" (224k — one row per wallet is all the data allows).
 ANN_INDEX = os.environ.get("FS_ANN_INDEX", "wallet-coin")
+# Exchange simulator: N processes each streaming a distinct share of the 46 day
+# files once, writing real features (and real vectors) as they go. Replaces the
+# blaster fleet for a high-volume-exchange demo — same ops/s, but genuine
+# traffic over the whole wallet population instead of one slice re-upserted.
+SIM_PROCS = int(os.environ.get("FS_SIM_PROCS", "0"))
 # Behaviour-vector writes start ON or OFF; flipped live by the EMBEDDINGS button
 # (POST /embeddings). OFF keeps the index quiescent for the low-p99 beat.
 EMBED_ON_DEFAULT = os.environ.get("FS_EMBED_ON", "0") not in ("0", "false", "off")
@@ -315,6 +320,70 @@ def _ingest_proc(shared, base_speed, days, profile):
 
 
 # --------------------------------------------------------------------------- #
+# exchange simulator process — a high-volume exchange, not synthetic re-writes
+#
+# The blaster below preloads ONE slice of day 1 and re-upserts it forever: high
+# ops/s, but the same keys over and over, so the wallet population never grows
+# and the vectors never change. This instead shards the 46 DAY FILES across
+# workers and streams each day once, computing real features and real behaviour
+# vectors as it goes — so throughput is genuine exchange traffic, and the ANN
+# index fills up to the dataset's true population as the demo runs.
+# --------------------------------------------------------------------------- #
+def _sim_proc(wid, nworkers, days, profile, max_inflight, shared):
+    import polars as pl
+
+    from .replay import COLUMNS, Fill, day_files
+
+    paths = day_files(days)[wid::nworkers]   # distinct days per worker
+    cluster = make_cluster(profile, "tuned")
+    session = cluster.connect(KEYSPACE)
+    ps = prepare_all(session)
+    vps = prepare_vector(session)
+    pipe = Pipeline(session, max_inflight=max_inflight, sample_every=4096)
+    key = f"bw_{wid}"
+    states: dict = {}
+    dirty: set[str] = set()
+    fc = 0
+    last_pub = time.monotonic()
+
+    for path in paths:
+        # stream one day at a time — preloading all of a worker's days would
+        # cost several GB per process
+        df = pl.read_parquet(path, columns=COLUMNS)
+        for addr, coin, px, sz, side, t, cpnl, crossed in df.iter_rows():
+            net = sz if side == "B" else -sz
+            fc += 1
+            pipe.execute(ps["wallet_coin"], (
+                addr, coin, net, px, (cpnl or 0.0), fc,
+                dt.datetime.fromtimestamp(t / 1000.0, tz=UTC),
+            ))
+            if vps is not None:
+                w = states.get(addr)
+                if w is None:
+                    w = states[addr] = WalletState()
+                w.update(Fill(addr, coin, px, sz, side, t, (cpnl or 0.0), bool(crossed)))
+                dirty.add(addr)
+                if fc % BLAST_EMB_EVERY == 0 and shared.get("embed_on", False):
+                    for a in dirty:
+                        s = states[a]
+                        pipe.execute(vps["wallet_vec"], (
+                            a, s.cum_realized_pnl, s.total_fills, s.gross_volume,
+                            abs(s.signed_volume), s.churn, s.archetype,
+                            _ts(s.last_ts), wallet_vector(s),
+                        ))
+                    dirty.clear()
+                elif fc % BLAST_EMB_EVERY == 0:
+                    dirty.clear()
+            if fc % 1024 == 0:
+                now = time.monotonic()
+                if now - last_pub >= 0.4:
+                    shared[key] = pipe.count
+                    last_pub = now
+        del df
+    shared[key] = pipe.count
+
+
+# --------------------------------------------------------------------------- #
 # write-blaster process — sustains real write load to ScyllaDB
 # --------------------------------------------------------------------------- #
 def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared,
@@ -462,6 +531,25 @@ def _ann_prober_proc(wid, nthreads, profile, k, shared):
             shared[key] = (count[0], empty[0], list(samples))
 
 
+def _metrics_thread():
+    """Poll the Cloud Prometheus proxy for SERVER-side truth.
+
+    The latencies this dashboard measures itself are recorded inside processes
+    contending with the load generator; these are recorded by the cluster and
+    the Vector Store, so they stay honest at any client load.
+    """
+    snap = None
+    while _proc.get("on", True):
+        try:
+            m, snap = cloudmetrics.collect(snap)
+            if m:
+                with _lock:
+                    STATS.update(m)
+        except Exception:
+            pass
+        time.sleep(15)
+
+
 # --------------------------------------------------------------------------- #
 # reader thread (web process) — the inference retrieval path
 # --------------------------------------------------------------------------- #
@@ -606,6 +694,14 @@ def _startup():
     # BURST). Even-split over the TOTAL so each gets a distinct share.
     total_b = BLASTERS + BURST_BLASTERS
     blasters = []
+    for w in range(SIM_PROCS):
+        sp = ctx.Process(
+            target=_sim_proc,
+            args=(w, SIM_PROCS, DAYS, PROFILE, BLAST_INFLIGHT, shared),
+            daemon=True,
+        )
+        sp.start()
+        blasters.append(sp)
     for w in range(total_b):
         burst_only = w >= BLASTERS
         # the first FS_BLAST_EMBED baseline workers also write vectors, so the
@@ -639,6 +735,7 @@ def _startup():
     _proc["vps"] = prepare_vector(session)
     time.sleep(1.5)
     threading.Thread(target=_reader_thread, args=(shared,), daemon=True).start()
+    threading.Thread(target=_metrics_thread, daemon=True).start()
 
 
 @app.on_event("shutdown")
@@ -838,8 +935,6 @@ HTML = """
       <button id=tabSim class=tab onclick=showTab('sim')>SIMILAR WALLETS</button>
       <button id=tabGraph class=tab onclick=showTab('graph')>GRAPH</button>
     </div>
-    <button id=burst onclick=doBurst()>⚡ BURST</button>
-    <span class=pill id=burststate>steady</span>
   </div>
 </header>
 <div class=grid id=tab-live>
@@ -853,23 +948,23 @@ HTML = """
   </div>
   <div class=card>
     <div class=sub>ScyllaDB Feature Store</div>
-    <div class=big><span id=p99>0.000</span><span class=unit> ms</span> <span class=legend><b style=color:#2bd6c6>● read p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● writes/s</b></span></div>
+    <div class=big><span id=p99>—</span><span class=unit> ms read p99</span> <span class=legend><b style=color:#2bd6c6>● read p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● writes/s</b></span></div>
     <canvas id=chart width=540 height=52></canvas>
     <div class=row><span class=sub>feature freshness (Δt = read - write)</span><b id=fresh>—</b></div>
-    <div class=row><span class=sub>writes/s</span><b id=wps>0</b></div>
+    <div class=row><span class=sub>write ops/s · p99 <span class=legend>(coordinator)</span></span><b><span id=wps>—</span> · <span id=wp99>—</span></b></div>
   </div>
   <div class=card id=vscard style=grid-column:1/3>
     <div class=sub style=display:flex;align-items:center;gap:10px>
-      <span>ScyllaDB Vector Search <span class=legend>ANN over the whole wallet
-      population — <b>same cluster, same CQL session</b> as the point reads above</span></span>
+      <span>ScyllaDB Vector Search</span>
       <button id=embtog onclick=toggleEmb() style=margin-left:auto>EMBEDDINGS —</button>
     </div>
     <div class=big><span id=annp99>—</span><span class=unit> ms ANN p99</span>
-      <span class=legend><b style=color:#2bd6c6>● ANN p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● ANN queries/s</b></span></div>
+      <span class=legend><b style=color:#2bd6c6>● ANN p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● ANN queries/s</b> &nbsp;— measured in the vector store</span></div>
     <canvas id=annchart width=1130 height=52></canvas>
-    <div class=row><span class=sub>ANN queries/s (concurrency <b id=annconc>0</b>)</span><b id=annqps>0</b></div>
-    <div class=row><span class=sub>ANN p50 / p99</span><b><span id=annp50>—</span> / <span id=annp99b>—</span> ms</b></div>
+    <div class=row><span class=sub>ANN queries/s <span class=legend>(server, concurrency <b id=annconc>0</b>)</span></span><b id=annqps>0</b></div>
     <div class=row><span class=sub>neighbours per query (k) / empty results</span><b><span id=annk>—</span> / <span id=annempty>0</span></b></div>
+    <div class=row><span class=sub>vectors in index <span class=legend>(server)</span></span><b id=srvvec>—</b></div>
+
   </div>
   <div class=card style=grid-column:1/3;position:relative;padding:8px>
     <canvas id=amp width=1130 height=64></canvas>
@@ -940,7 +1035,6 @@ function drawAnn(){anc.clearRect(0,0,an.width,an.height);
  line(anc,an,aqH,FG,Math.max(...aqH,1));     // ANN queries/s (white)
  line(anc,an,aH,TEAL,Math.max(...aH,2));}    // ANN p99 (teal, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
-function doBurst(){fetch('/burst',{method:'POST'});}
 // live embedding-write toggle: ON starts CDC re-indexing (watch the ANN tail
 // climb); OFF leaves the index quiescent for the single-digit-p99 beat.
 function toggleEmb(){fetch('/embeddings',{method:'POST'});}
@@ -1095,25 +1189,34 @@ ws.onmessage=e=>{const s=JSON.parse(e.data);
   seedRows(document.getElementById('smart'),s.seeds.smart);}
  if(!s.vector_on){tabSim.style.display='none';tabGraph.style.display='none';}
  fps.innerHTML=fmt(s.fills_per_s)+'<span class=unit> fills/s</span>';
- wps.textContent=fmt(s.writes_per_s); ftot.textContent=s.fills_total.toLocaleString();
+ wps.textContent=(s.srv_write_ops!==undefined)?fmt(s.srv_write_ops):fmt(s.writes_per_s);
+ ftot.textContent=s.fills_total.toLocaleString();
  card.textContent=s.active_coins+' / '+s.wallets.toLocaleString();
  clock.textContent=(s.data_time||'—').replace('T',' ').slice(0,19);
- p99.textContent=s.read_p99_ms.toFixed(3);
+ const srvR=s.srv_read_p99_ms, srvW=s.srv_write_ops, srvWp=s.srv_write_p99_ms;
+ p99.textContent=(srvR!==undefined&&srvR!==null)?srvR.toFixed(2):'—';
+ wp99.textContent=(srvWp!==undefined&&srvWp!==null)?srvWp.toFixed(2)+' ms':'—';
  fresh.textContent=s.fresh_us<1000?s.fresh_us.toFixed(0)+' µs':(s.fresh_us/1000).toFixed(2)+' ms';
  liveFps=s.fills_per_s;liveWps=s.writes_per_s;
  ampx.textContent='× '+Math.round(s.writes_per_s/Math.max(s.fills_per_s,1))+' write amplification';
- burststate.textContent=s.bursting?'BURSTING':'steady';
  if(s.embed_on!==undefined){embtog.textContent='EMBEDDINGS '+(s.embed_on?'ON':'OFF');
   embtog.className=s.embed_on?'burston':'';}
- document.getElementById('burst').className=s.bursting?'burston':'';
- sH.push(s.fills_per_s); wH.push(s.writes_per_s); pH.push(s.read_p99_ms);
+ sH.push(s.fills_per_s);
+ wH.push(s.srv_write_ops!==undefined?s.srv_write_ops:s.writes_per_s);
+ pH.push((s.srv_read_p99_ms!==undefined&&s.srv_read_p99_ms!==null)?s.srv_read_p99_ms:s.read_p99_ms);
  [sH,wH,pH].forEach(a=>{if(a.length>120)a.shift()}); drawSpark(); drawChart();
  // vector-search panel: hidden unless the prober fleet is running
+ if(s.srv_indexes){const ix=s.srv_indexes[s.ann_index==='wallet'?'wallet_embedding_idx':'wallet_coin_embedding_idx']||{};
+  srvvec.textContent=ix.vectors?ix.vectors.toLocaleString():'—';
+}
  if(s.ann_qps===undefined){vscard.style.display='none';}else{vscard.style.display='';
-  annp99.textContent=s.ann_p99_ms.toFixed(2); annp99b.textContent=s.ann_p99_ms.toFixed(2);
-  annp50.textContent=s.ann_p50_ms.toFixed(2); annqps.textContent=fmt(s.ann_qps);
   annconc.textContent=s.ann_conc; annk.textContent=s.ann_k; annempty.textContent=s.ann_empty;
-  aH.push(s.ann_p99_ms); aqH.push(s.ann_qps);
+  const ix2=(s.srv_indexes||{})[s.ann_index==='wallet'?'wallet_embedding_idx':'wallet_coin_embedding_idx']||{};
+  const sp99=(ix2.p99_ms!==undefined&&ix2.p99_ms!==null)?ix2.p99_ms:null;
+  const sqps=(ix2.qps!==undefined)?ix2.qps:null;
+  annp99.textContent=sp99!==null?sp99.toFixed(2):'—';
+  annqps.textContent=sqps!==null?fmt(sqps):'—';
+  aH.push(sp99!==null?sp99:s.ann_p99_ms); aqH.push(sqps!==null?sqps:s.ann_qps);
   [aH,aqH].forEach(a=>{if(a.length>120)a.shift()}); drawAnn();}
  // write-load skew bars (monochrome)
  const hmx=Math.max(...s.hot.map(h=>h.vol),1);

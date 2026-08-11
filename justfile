@@ -152,23 +152,31 @@ cloud-schema:
 
 # launch the live dashboard on the remote host against ScyllaDB Cloud (detached).
 # assumes the repo + .venv + ~/.fs-cloud.env are already set up on the remote.
-# blasters: background write-load procs (24 is the sweet spot on a 48-vCPU box).
-# embed: how many baseline blasters ALSO write behaviour vectors — plain
-# blasters never touch the vector index, so leave this >0 for webinar 2.
-cloud-dashboard blasters="24" burst_blasters="16" speed="10" days="1" embed="6":
+#
+# sim_procs: exchange-simulator processes, each streaming a DISTINCT share of the
+# 46 day files once — real fills, real features, real vectors (not the old
+# blasters, which re-upserted one slice of day 1 forever).
+#
+# 20 is the measured demo default: ~83k coordinator write ops/s with server-side
+# write p99 3.58 ms, read p99 7.17 ms and ANN p99 0.5 ms — single digit across
+# the board with the vector index live. 36 procs reaches ~137k ops/s but the
+# cluster's own write p99 goes to 41 ms. See docs/RESULTS.md.
+cloud-dashboard sim_procs="20" speed="10" days="46" embed_on="1" ann_procs="4" ann_threads="4":
     #!/usr/bin/env bash
     set -euo pipefail
     [ -n "{{ remote }}" ] || { echo "set FS_REMOTE=user@host first"; exit 1; }
     if ssh {{ remote }} 'curl -sf -m3 http://127.0.0.1:8090/stats >/dev/null 2>&1'; then
       echo "dashboard already running on {{ remote }}:8090 — leaving it as-is"
-      echo "(use 'just cloud-dashboard-restart' to change blasters/speed)"
+      echo "(use 'just cloud-dashboard-restart' to change the load)"
     else
       ssh {{ remote }} "cd {{ rdir }} && source ~/.fs-cloud.env && \
-        FS_SPEED={{ speed }} FS_DAYS={{ days }} FS_BLASTERS={{ blasters }} \
-        FS_BURST_BLASTERS={{ burst_blasters }} FS_BLAST_EMBED={{ embed }} PYTHONPATH=src \
-        nohup .venv/bin/python -m uvicorn --app-dir src feature_store.dashboard:app \
-        --host 0.0.0.0 --port 8090 >/tmp/fs-dashboard.log 2>&1 & sleep 1; echo launched"
-      echo "starting on {{ remote }}:8090 (baseline {{ blasters }} + {{ burst_blasters }} burst, {{ embed }} embedding)"
+        FS_SPEED={{ speed }} FS_DAYS={{ days }} FS_SIM_PROCS={{ sim_procs }} \
+        FS_BLASTERS=0 FS_BURST_BLASTERS=0 FS_EMBED_ON={{ embed_on }} \
+        FS_ANN_PROCS={{ ann_procs }} FS_ANN_THREADS={{ ann_threads }} \
+        FS_ANN_INDEX=wallet-coin PYTHONPATH=src \
+        setsid nohup .venv/bin/python -m uvicorn --app-dir src feature_store.dashboard:app \
+        --host 0.0.0.0 --port 8090 >/tmp/fs-dashboard.log 2>&1 < /dev/null & echo launched"
+      echo "starting on {{ remote }}:8090 ({{ sim_procs }} sim procs, ANN concurrency $(( {{ ann_procs }} * {{ ann_threads }} )))"
     fi
 
 # ANN query load against Cloud, driven from the remote demo host
@@ -178,10 +186,10 @@ cloud-bench-ann n="200000" procs="12" threads="8" k="10":
         --n {{ n }} --procs {{ procs }} --threads {{ threads }} --k {{ k }}"
 
 # force a restart (kill + relaunch) — use to change blasters/speed/days
-cloud-dashboard-restart blasters="24" burst_blasters="16" speed="0" days="1":
+cloud-dashboard-restart sim_procs="20" speed="10" days="46":
     @just cloud-dashboard-stop
     @sleep 2
-    @just cloud-dashboard {{ blasters }} {{ burst_blasters }} {{ speed }} {{ days }}
+    @just cloud-dashboard {{ sim_procs }} {{ speed }} {{ days }}
 
 # stop the remote dashboard AND its spawned blaster procs (fuser alone leaves
 # the blasters orphaned). The [v] class stops the pattern matching this command.
