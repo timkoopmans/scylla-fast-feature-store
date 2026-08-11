@@ -161,7 +161,7 @@ cloud-schema:
 # write p99 3.58 ms, read p99 7.17 ms and ANN p99 0.5 ms — single digit across
 # the board with the vector index live. 36 procs reaches ~137k ops/s but the
 # cluster's own write p99 goes to 41 ms. See docs/RESULTS.md.
-cloud-dashboard sim_procs="20" speed="10" days="46" embed_on="1" ann_procs="4" ann_threads="4":
+cloud-dashboard sim_procs="20" speed="10" days="46" embed_on="0" ann_procs="4" ann_threads="4":
     #!/usr/bin/env bash
     set -euo pipefail
     [ -n "{{ remote }}" ] || { echo "set FS_REMOTE=user@host first"; exit 1; }

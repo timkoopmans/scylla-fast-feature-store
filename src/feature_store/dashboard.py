@@ -88,6 +88,10 @@ ANN_K = int(os.environ.get("FS_ANN_K", "10"))
 # Which ANN index the probers search: "wallet-coin" (981k vectors, the realistic
 # population) or "wallet" (224k — one row per wallet is all the data allows).
 ANN_INDEX = os.environ.get("FS_ANN_INDEX", "wallet-coin")
+# ScyllaDB Cloud collects metrics on a ~20s cadence; polling faster just returns
+# the same sample, so we poll just past it and the scraper holds values when the
+# source has not advanced.
+METRICS_POLL_SECS = float(os.environ.get("FS_METRICS_POLL_SECS", "21"))
 # Exchange simulator: N processes each streaming a distinct share of the 46 day
 # files once, writing real features (and real vectors) as they go. Replaces the
 # blaster fleet for a high-volume-exchange demo — same ops/s, but genuine
@@ -341,9 +345,11 @@ def _sim_proc(wid, nworkers, days, profile, max_inflight, shared):
     vps = prepare_vector(session)
     pipe = Pipeline(session, max_inflight=max_inflight, sample_every=4096)
     key = f"bw_{wid}"
+    vkey = f"vw_{wid}"
     states: dict = {}
     dirty: set[str] = set()
     fc = 0
+    vc = 0
     last_pub = time.monotonic()
 
     for path in paths:
@@ -358,21 +364,30 @@ def _sim_proc(wid, nworkers, days, profile, max_inflight, shared):
                 dt.datetime.fromtimestamp(t / 1000.0, tz=UTC),
             ))
             if vps is not None:
-                w = states.get(addr)
-                if w is None:
-                    w = states[addr] = WalletState()
-                w.update(Fill(addr, coin, px, sz, side, t, (cpnl or 0.0), bool(crossed)))
-                dirty.add(addr)
-                if fc % BLAST_EMB_EVERY == 0 and shared.get("embed_on", False):
-                    for a in dirty:
-                        s = states[a]
-                        pipe.execute(vps["wallet_vec"], (
-                            a, s.cum_realized_pnl, s.total_fills, s.gross_volume,
-                            abs(s.signed_volume), s.churn, s.archetype,
-                            _ts(s.last_ts), wallet_vector(s),
-                        ))
-                    dirty.clear()
-                elif fc % BLAST_EMB_EVERY == 0:
+                # state per (wallet, coin) — the grain of wallet_coin_embedding_idx,
+                # which is the index the ANN demo searches. Keying by wallet alone
+                # would keep the searched index frozen while a different one churned.
+                pk = (addr, coin)
+                st = states.get(pk)
+                if st is None:
+                    st = states[pk] = [WalletState(), 0.0, 0.0]  # state, |size|, net size
+                st[0].update(Fill(addr, coin, px, sz, side, t, (cpnl or 0.0), bool(crossed)))
+                st[1] += sz
+                st[2] += net
+                dirty.add(pk)
+                if fc % BLAST_EMB_EVERY == 0:
+                    if shared.get("embed_on", False):
+                        for a, c in dirty:
+                            w2, szsum, netsz = states[(a, c)]
+                            w2.coin_gross = {0: w2.gross_volume}
+                            pipe.execute(vps["wallet_coin_vec"], (
+                                a, c, netsz,
+                                (w2.gross_volume / szsum) if szsum else 0.0,
+                                w2.cum_realized_pnl, w2.total_fills,
+                                _ts(w2.last_ts), wallet_vector(w2),
+                            ))
+                            vc += 1
+                        shared[vkey] = vc
                     dirty.clear()
             if fc % 1024 == 0:
                 now = time.monotonic()
@@ -547,7 +562,7 @@ def _metrics_thread():
                     STATS.update(m)
         except Exception:
             pass
-        time.sleep(15)
+        time.sleep(METRICS_POLL_SECS)
 
 
 # --------------------------------------------------------------------------- #
@@ -560,6 +575,7 @@ def _reader_thread(shared):
     lat = deque(maxlen=3000)
     whist = deque()  # (t, total_writes) over a sliding window, for a smooth rate
     ahist = deque()  # (t, total_ann_queries) — same trick for the ANN rate
+    vhist = deque()  # (t, total_vector_writes) — drives the index-build line
     while _proc.get("on", True):
         # Freshness probe: write a sentinel feature, immediately read it back, and
         # time the write->visible round trip. This is the store's freshness floor —
@@ -635,6 +651,15 @@ def _reader_thread(shared):
                 ann_tot += c
                 ann_empty += e
                 ann_samples.extend(ss)
+        vec_tot = sum(v for k, v in snap.items() if k.startswith("vw_"))
+        vhist.append((now_w, vec_tot))
+        while len(vhist) > 1 and now_w - vhist[0][0] > 2.5:
+            vhist.popleft()
+        vps_rate = (
+            (vhist[-1][1] - vhist[0][1]) / (vhist[-1][0] - vhist[0][0])
+            if len(vhist) > 1 and vhist[-1][0] > vhist[0][0]
+            else 0.0
+        )
         ahist.append((now_w, ann_tot))
         while len(ahist) > 1 and now_w - ahist[0][0] > 2.5:
             ahist.popleft()
@@ -667,6 +692,7 @@ def _reader_thread(shared):
             STATS["vector_on"] = _proc.get("vps") is not None
             STATS["bursting"] = bool(snap.get("bursting", False))
             STATS["embed_on"] = bool(snap.get("embed_on", False))
+            STATS["vec_writes_per_s"] = max(0.0, vps_rate)
             STATS["fresh_us"] = round(fresh_us, 1)
             dm = snap.get("data_time_ms")
             STATS["data_time"] = _ts(dm).isoformat() if dm else None
@@ -956,14 +982,15 @@ HTML = """
   <div class=card id=vscard style=grid-column:1/3>
     <div class=sub style=display:flex;align-items:center;gap:10px>
       <span>ScyllaDB Vector Search</span>
-      <button id=embtog onclick=toggleEmb() style=margin-left:auto>EMBEDDINGS —</button>
+      <button id=embtog class=tab onclick=toggleEmb() style=margin-left:auto>EMBEDDING WRITES —</button>
     </div>
     <div class=big><span id=annp99>—</span><span class=unit> ms ANN p99</span>
-      <span class=legend><b style=color:#2bd6c6>● ANN p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● ANN queries/s</b> &nbsp;— measured in the vector store</span></div>
+      <span class=legend><b style=color:#2bd6c6>● ANN p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● ANN queries/s</b> &nbsp;<b style=color:#f5a623>● index build rate</b> &nbsp;<b id=annidx>—</b></span></div>
     <canvas id=annchart width=1130 height=52></canvas>
     <div class=row><span class=sub>ANN queries/s <span class=legend>(server, concurrency <b id=annconc>0</b>)</span></span><b id=annqps>0</b></div>
     <div class=row><span class=sub>neighbours per query (k) / empty results</span><b><span id=annk>—</span> / <span id=annempty>0</span></b></div>
     <div class=row><span class=sub>vectors in index <span class=legend>(server)</span></span><b id=srvvec>—</b></div>
+    <div class=row><span class=sub>index build rate <span class=legend>(server, vectors re-indexed/s)</span></span><b id=srvbuild>—</b></div>
 
   </div>
   <div class=card style=grid-column:1/3;position:relative;padding:8px>
@@ -1020,11 +1047,15 @@ HTML = """
   </div>
 </div>
 <script>
-const sH=[],pH=[],wH=[],aH=[],aqH=[];
+const sH=[],pH=[],wH=[],aH=[],aqH=[],abH=[];
+// Headline numbers come from the cluster's own metrics, which the Cloud only
+// collects every ~20s (verified: sample timestamps step in 20s). Plotting that
+// draws a staircase, so the SPARKLINES use the client-side stream (~3/s) for
+// shape while the numbers beside them stay server-measured.
 const sp=document.getElementById('spark'),sc=sp.getContext('2d');
 const ch=document.getElementById('chart'),cc=ch.getContext('2d');
 const an=document.getElementById('annchart'),anc=an.getContext('2d');
-const FG='#e4e4e7',MUT='#71717a',TEAL='#2bd6c6';
+const FG='#e4e4e7',MUT='#71717a',TEAL='#2bd6c6',AMBER='#f5a623';
 function line(ctx,cv,arr,color,max,dash){if(arr.length<2)return;ctx.setLineDash(dash||[]);ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.8;
  arr.forEach((v,i)=>{const x=i/(arr.length-1)*cv.width,y=cv.height-(v/(max||1))*cv.height*0.92-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.setLineDash([]);}
 function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,FG,Math.max(...sH,1));}
@@ -1033,6 +1064,7 @@ function drawChart(){cc.clearRect(0,0,ch.width,ch.height);
  line(cc,ch,pH,TEAL,Math.max(...pH,2));}     // read p99 (ScyllaDB teal, own scale)
 function drawAnn(){anc.clearRect(0,0,an.width,an.height);
  line(anc,an,aqH,FG,Math.max(...aqH,1));     // ANN queries/s (white)
+ line(anc,an,abH,AMBER,Math.max(...abH,1));  // index build rate (amber, own scale)
  line(anc,an,aH,TEAL,Math.max(...aH,2));}    // ANN p99 (teal, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
 // live embedding-write toggle: ON starts CDC re-indexing (watch the ANN tail
@@ -1199,11 +1231,10 @@ ws.onmessage=e=>{const s=JSON.parse(e.data);
  fresh.textContent=s.fresh_us<1000?s.fresh_us.toFixed(0)+' µs':(s.fresh_us/1000).toFixed(2)+' ms';
  liveFps=s.fills_per_s;liveWps=s.writes_per_s;
  ampx.textContent='× '+Math.round(s.writes_per_s/Math.max(s.fills_per_s,1))+' write amplification';
- if(s.embed_on!==undefined){embtog.textContent='EMBEDDINGS '+(s.embed_on?'ON':'OFF');
-  embtog.className=s.embed_on?'burston':'';}
+ if(s.embed_on!==undefined){embtog.textContent='EMBEDDING WRITES '+(s.embed_on?'ON':'OFF');
+  embtog.className=s.embed_on?'tab on':'tab';}
  sH.push(s.fills_per_s);
- wH.push(s.srv_write_ops!==undefined?s.srv_write_ops:s.writes_per_s);
- pH.push((s.srv_read_p99_ms!==undefined&&s.srv_read_p99_ms!==null)?s.srv_read_p99_ms:s.read_p99_ms);
+ wH.push(s.writes_per_s); pH.push(s.read_p99_ms);
  [sH,wH,pH].forEach(a=>{if(a.length>120)a.shift()}); drawSpark(); drawChart();
  // vector-search panel: hidden unless the prober fleet is running
  if(s.srv_indexes){const ix=s.srv_indexes[s.ann_index==='wallet'?'wallet_embedding_idx':'wallet_coin_embedding_idx']||{};
@@ -1216,8 +1247,9 @@ ws.onmessage=e=>{const s=JSON.parse(e.data);
   const sqps=(ix2.qps!==undefined)?ix2.qps:null;
   annp99.textContent=sp99!==null?sp99.toFixed(2):'—';
   annqps.textContent=sqps!==null?fmt(sqps):'—';
-  aH.push(sp99!==null?sp99:s.ann_p99_ms); aqH.push(sqps!==null?sqps:s.ann_qps);
-  [aH,aqH].forEach(a=>{if(a.length>120)a.shift()}); drawAnn();}
+  annidx.textContent=s.ann_index==='wallet'?'wallet_embedding_idx':'wallet_coin_embedding_idx';
+  aH.push(s.ann_p99_ms); aqH.push(s.ann_qps); abH.push(s.vec_writes_per_s||0);
+  [aH,aqH,abH].forEach(a=>{if(a.length>120)a.shift()}); drawAnn();}
  // write-load skew bars (monochrome)
  const hmx=Math.max(...s.hot.map(h=>h.vol),1);
  hot.innerHTML=s.hot.map(h=>`<div class=row><span class=coin>${h.coin}</span>`+

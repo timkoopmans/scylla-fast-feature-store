@@ -69,6 +69,11 @@ def scrape() -> dict:
             val = float(parts[0])
         except ValueError:
             continue
+        if len(parts) > 1:
+            try:                     # exporter timestamp (ms)
+                out["_ts_max"] = max(out.get("_ts_max", 0.0), float(parts[1]))
+            except ValueError:
+                pass
         out.setdefault(name, []).append((_parse_labels(labels_s), val))
     return out
 
@@ -104,9 +109,20 @@ def _p99_from_buckets(before, after, **match) -> float:
     if total <= 0:
         return 0.0
     target = total * 0.99
+    # Interpolate WITHIN the bucket, the way Prometheus histogram_quantile does.
+    # Returning the bucket's upper bound instead would read ~10 ms where Grafana
+    # shows ~6.9 ms on the same data — same truth, but it looks like a bug.
+    prev_le, prev_cum = 0.0, 0.0
     for le in sorted(delta):
-        if delta[le] >= target:
-            return le
+        cum = delta[le]
+        if cum >= target:
+            if le == float("inf"):
+                return prev_le
+            span = cum - prev_cum
+            if span <= 0:
+                return le
+            return prev_le + (le - prev_le) * ((target - prev_cum) / span)
+        prev_le, prev_cum = le, cum
     return float("inf")
 
 
@@ -118,6 +134,11 @@ def collect(prev: dict | None = None) -> tuple[dict, dict]:
     if not prev or "_t" not in prev:
         now["_t"] = time.time()
         return {}, now
+    # The Cloud collects on a fixed ~20s cadence, so a faster poll can return
+    # byte-identical data. Differencing that gives an empty window and a
+    # percentile of 0 — worse than no update at all, so hold the last values.
+    if now.get("_ts_max") and now.get("_ts_max") == prev.get("_ts_max"):
+        return {}, prev
     dt = time.time() - prev["_t"]
     if dt <= 0:
         return {}, prev
@@ -143,6 +164,16 @@ def collect(prev: dict | None = None) -> tuple[dict, dict]:
         if name:
             # same index is reported by every VS node — take max, not sum
             idx.setdefault(name, {})["vectors"] = max(idx.get(name, {}).get("vectors", 0), int(v))
+    # index build rate: vectors (re)indexed per second, from the CDC consumer
+    if "index_modified" in now and "index_modified" in prev:
+        names = {lb.get("index_name") for lb, _ in now["index_modified"]}
+        for name in filter(None, names):
+            d = _sum(now["index_modified"], index_name=name) - \
+                _sum(prev["index_modified"], index_name=name)
+            # summed across VS nodes, each of which indexes the same rows
+            nodes = len({lb.get("instance") for lb, _ in now["index_modified"]
+                         if lb.get("index_name") == name}) or 1
+            idx.setdefault(name, {})["build_rate"] = max(0.0, d / dt / nodes)
     if "request_latency_seconds_count" in now and "request_latency_seconds_count" in prev:
         names = {lb.get("index_name") for lb, _ in now["request_latency_seconds_count"]}
         for name in filter(None, names):
