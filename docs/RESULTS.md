@@ -137,6 +137,76 @@ is a larger multiple.) The dashboard also shows per-coin write-load skew (BTC/ET
 HYPE dominate — motivates partition-key design), taker buy/sell imbalance per coin,
 and the live wallet-archetype mix (market-maker / directional / mixed).
 
+## Vector search (webinar 2) — ANN on the same cluster
+
+Measured 2026-08-11 against **ScyllaDB Cloud** (3-node `AWS_US_EAST_1`, RF=3)
+with the managed **Vector Store service on 2 nodes**. Client: the same 48-vCPU
+ARM EC2 box, same region. Query: `ORDER BY embedding ANN OF ? LIMIT ?` over
+`wallet_features` (`wallet_embedding_idx`, COSINE, 16-dim), k=10, driven by
+`bench.py ann` — the same multiprocess client shape as the point-read bench, so
+the two p99s are directly comparable.
+
+> The bench queries the index **directly**, not via `similar_wallets()` — that
+> helper adds a seed point-read plus k neighbour point-reads per call, which
+> would measure the feature store instead of the index. Empty and short (`<k`)
+> neighbour lists are counted separately from latency: an empty result is *fast*
+> but wrong, and must never be averaged into a latency win.
+
+### Clean run (no write load)
+
+| concurrency | ANN queries/s | p50 ms | p99 ms | max ms |
+|------------:|--------------:|-------:|-------:|-------:|
+| 1   (1p×1t)   | 315    | **1.261** | 3.330  | 7 |
+| 16  (4p×4t)   | 2,342  | 1.761 | 4.904  | 17 |
+| 96  (12p×8t)  | 9,637  | 3.567 | 12.726 | 48 |
+| 256 (32p×8t)  | 15,235 | 5.148 | 27.931 | 87 |
+| 480 (40p×12t) | 16,334 | 15.190 | 64.117 | 1,050 |
+
+0 errors and 0 empty results throughout.
+
+**Headline:** a single ANN neighbour lookup over the whole wallet population
+costs **p50 1.26 ms** — the same order as the feature point read (2.17 ms p99),
+on the *same* cluster, with no second database and no sync ETL.
+
+**The knee is ~256.** 256 → 480 bought 7% more throughput for 3× the p50 and a
+1-second max: that is a saturated *service*, not a saturated client.
+
+### Under concurrent write load (the "one engine" claim)
+
+Same sweep with the dashboard's 40-blaster fleet running (24 baseline + 16 burst,
+6 of them `FS_BLAST_EMBED` workers re-upserting behaviour vectors, so CDC is
+re-indexing throughout) at **~138k writes/s**:
+
+| concurrency | ANN queries/s | p50 ms | p99 ms |
+|------------:|--------------:|-------:|-------:|
+| 96  | 7,585  | 4.908 | 22.892 |
+| 256 | 13,183 | 8.682 | 35.391 |
+
+0 errors, 0 empty results. **Concurrent write + re-index load costs ~13%
+throughput** (15,235 → 13,183 at concurrency 256). One cluster sustaining ~138k
+writes/s, CDC vector re-indexing, and 13k ANN queries/s simultaneously.
+
+### What limits it: vector-store CPU
+
+The ceiling is **fixed per-request cost, not search work** — so it scales with
+cores, and the index being small does not help:
+
+- Single-threaded p50 (1.26 ms) is essentially the **1.28 ms network floor**
+  measured for point reads. The HNSW search over ~16k × 16-dim vectors (~1 MB of
+  vectors) is nearly free; the time is the CQL coordinator → vector-store hop.
+- At the knee the Vector Store nodes ran at **79% CPU** while memory sat at 18%
+  (728 MB) and disk was flat at 3.3 GB with 70 GB free. CPU is the only resource
+  near its limit.
+- Write/re-index load costing only ~13% confirms re-indexing is not the drain.
+
+**TODO:** re-run this sweep after scaling the Vector Store nodes up in vCPU —
+throughput should scale close to linearly with cores. Also re-run on a *large*
+index: these numbers are from ~16k wallet vectors and 255 coin vectors, small
+enough that ANN recall is not meaningfully exercised. Population beyond that
+needs a consumer run over multiple days with the blaster fleet stopped (blasters
+loop a fixed slice of fills, so they re-upsert the same wallets — sustained
+re-index load, flat vector count).
+
 ## Reproduce
 
 ```bash
