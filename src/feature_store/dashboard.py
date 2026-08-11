@@ -75,8 +75,16 @@ EMB_FLUSH_SECS = float(os.environ.get("FS_EMB_FLUSH_SECS", "2.0"))
 # WITH the vector, producing the CDC row images the Vector Store re-indexes.
 # Costlier per write than a plain blaster: that re-index cost is the point.
 BLAST_EMBED = int(os.environ.get("FS_BLAST_EMBED", "0"))
-# fills between embedding flushes inside an embedding blaster
+# fills between embedding flushes inside an embedding blaster. LOWER = more
+# vector upserts/s = more CDC re-index work for the Vector Store. This is the
+# amplification knob for the webinar-2 index-build story.
 BLAST_EMB_EVERY = int(os.environ.get("FS_BLAST_EMB_EVERY", "20000"))
+# ANN prober fleet: background processes issuing continuous neighbour lookups so
+# the Vector Store sees real query load and the dashboard can show live ANN
+# latency. Concurrency = FS_ANN_PROCS x FS_ANN_THREADS (0 procs = off).
+ANN_PROCS = int(os.environ.get("FS_ANN_PROCS", "0"))
+ANN_THREADS = int(os.environ.get("FS_ANN_THREADS", "10"))
+ANN_K = int(os.environ.get("FS_ANN_K", "10"))
 
 app = FastAPI(title="ScyllaDB feature store — live")
 
@@ -392,6 +400,63 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared,
 
 
 # --------------------------------------------------------------------------- #
+# ANN prober process — sustained neighbour-lookup load on the Vector Store
+# --------------------------------------------------------------------------- #
+def _ann_prober_proc(wid, nthreads, profile, k, shared):
+    """Continuously issue ANN lookups and publish live latency to the web proc.
+
+    Runs in its own process for the same reason the blasters do: the web
+    process is GIL-bound, and probing from inside it would measure Python, not
+    the Vector Store. Each publish carries a small latency SAMPLE (not a
+    pre-computed percentile) so the web process can merge samples across the
+    fleet and report TRUE percentiles rather than an average of averages.
+    """
+    import random
+
+    cluster = make_cluster(profile, "tuned")
+    session = cluster.connect(KEYSPACE)
+    vps = prepare_vector(session)
+    if vps is None:
+        return
+    seeds = [list(r.embedding) for r in
+             session.execute("SELECT embedding FROM wallet_features LIMIT 5000")
+             if r.embedding]
+    if not seeds:
+        return
+    stmt = vps["ann_wallets"]
+    key = f"ann_{wid}"
+    lock = threading.Lock()
+    samples: deque = deque(maxlen=400)
+    count = [0]
+    empty = [0]
+
+    def run(tid):
+        rnd = random.Random(wid * 977 + tid)
+        while True:
+            v = seeds[rnd.randrange(len(seeds))]
+            t0 = time.perf_counter()
+            try:
+                rows = session.execute(stmt, (v, k))
+                ms = (time.perf_counter() - t0) * 1000.0
+                got = sum(1 for _ in rows)
+                with lock:
+                    samples.append(ms)
+                    count[0] += 1
+                    if not got:
+                        empty[0] += 1
+            except Exception:
+                time.sleep(0.05)
+
+    for t in range(nthreads):
+        threading.Thread(target=run, args=(t,), daemon=True).start()
+
+    while True:
+        time.sleep(0.5)
+        with lock:
+            shared[key] = (count[0], empty[0], list(samples))
+
+
+# --------------------------------------------------------------------------- #
 # reader thread (web process) — the inference retrieval path
 # --------------------------------------------------------------------------- #
 def _reader_thread(shared):
@@ -400,6 +465,7 @@ def _reader_thread(shared):
     ps = prepare_all(session)
     lat = deque(maxlen=3000)
     whist = deque()  # (t, total_writes) over a sliding window, for a smooth rate
+    ahist = deque()  # (t, total_ann_queries) — same trick for the ANN rate
     while _proc.get("on", True):
         # Freshness probe: write a sentinel feature, immediately read it back, and
         # time the write->visible round trip. This is the store's freshness floor —
@@ -465,7 +531,34 @@ def _reader_thread(shared):
             if len(whist) > 1 and whist[-1][0] > whist[0][0]
             else 0.0
         )
+        # ANN prober fleet: merge the per-process samples for true percentiles,
+        # and derive queries/s from the delta of their counters.
+        ann_tot = ann_empty = 0
+        ann_samples: list[float] = []
+        for kk, vv in snap.items():
+            if kk.startswith("ann_") and isinstance(vv, tuple):
+                c, e, ss = vv
+                ann_tot += c
+                ann_empty += e
+                ann_samples.extend(ss)
+        ahist.append((now_w, ann_tot))
+        while len(ahist) > 1 and now_w - ahist[0][0] > 2.5:
+            ahist.popleft()
+        aqps = (
+            (ahist[-1][1] - ahist[0][1]) / (ahist[-1][0] - ahist[0][0])
+            if len(ahist) > 1 and ahist[-1][0] > ahist[0][0]
+            else 0.0
+        )
+
         with _lock:
+            if ann_samples:
+                a = sorted(ann_samples)
+                STATS["ann_p50_ms"] = round(a[int(len(a) * 0.50)], 3)
+                STATS["ann_p99_ms"] = round(a[min(len(a) - 1, int(len(a) * 0.99))], 3)
+                STATS["ann_qps"] = max(0.0, aqps)
+                STATS["ann_empty"] = ann_empty
+                STATS["ann_conc"] = ANN_PROCS * ANN_THREADS
+                STATS["ann_k"] = ANN_K
             STATS["scoreboard"] = board
             STATS["hot"] = sorted(hot, key=lambda x: x["vol"], reverse=True)
             STATS["fills_total"] = snap.get("fills_total", 0)
@@ -516,6 +609,16 @@ def _startup():
         )
         b.start()
         blasters.append(b)
+    # ANN prober fleet (webinar 2): keeps the Vector Store under real query load
+    # and feeds the live ANN panel. Concurrency = ANN_PROCS x ANN_THREADS.
+    for w in range(ANN_PROCS):
+        a = ctx.Process(
+            target=_ann_prober_proc,
+            args=(w, ANN_THREADS, PROFILE, ANN_K, shared),
+            daemon=True,
+        )
+        a.start()
+        blasters.append(a)   # same lifecycle as the write fleet (stopped together)
     _proc.update(on=True, p=p, blasters=blasters, mgr=mgr, shared=shared)
     # web-process session for the on-demand similarity endpoint (the reader
     # thread keeps its own; driver sessions are thread-safe either way)
@@ -732,6 +835,16 @@ HTML = """
     <div class=row><span class=sub>feature freshness (Δt = read - write)</span><b id=fresh>—</b></div>
     <div class=row><span class=sub>writes/s</span><b id=wps>0</b></div>
   </div>
+  <div class=card id=vscard style=grid-column:1/3>
+    <div class=sub>ScyllaDB Vector Search <span class=legend>ANN over the whole wallet
+      population — <b>same cluster, same CQL session</b> as the point reads above</span></div>
+    <div class=big><span id=annp99>—</span><span class=unit> ms ANN p99</span>
+      <span class=legend><b style=color:#2bd6c6>● ANN p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● ANN queries/s</b></span></div>
+    <canvas id=annchart width=1130 height=52></canvas>
+    <div class=row><span class=sub>ANN queries/s (concurrency <b id=annconc>0</b>)</span><b id=annqps>0</b></div>
+    <div class=row><span class=sub>ANN p50 / p99</span><b><span id=annp50>—</span> / <span id=annp99b>—</span> ms</b></div>
+    <div class=row><span class=sub>neighbours per query (k) / empty results</span><b><span id=annk>—</span> / <span id=annempty>0</span></b></div>
+  </div>
   <div class=card style=grid-column:1/3;position:relative;padding:8px>
     <canvas id=amp width=1130 height=64></canvas>
     <span class="sub ampend" style=left:14px>fills</span>
@@ -786,9 +899,10 @@ HTML = """
   </div>
 </div>
 <script>
-const sH=[],pH=[],wH=[];
+const sH=[],pH=[],wH=[],aH=[],aqH=[];
 const sp=document.getElementById('spark'),sc=sp.getContext('2d');
 const ch=document.getElementById('chart'),cc=ch.getContext('2d');
+const an=document.getElementById('annchart'),anc=an.getContext('2d');
 const FG='#e4e4e7',MUT='#71717a',TEAL='#2bd6c6';
 function line(ctx,cv,arr,color,max,dash){if(arr.length<2)return;ctx.setLineDash(dash||[]);ctx.beginPath();ctx.strokeStyle=color;ctx.lineWidth=1.8;
  arr.forEach((v,i)=>{const x=i/(arr.length-1)*cv.width,y=cv.height-(v/(max||1))*cv.height*0.92-4;i?ctx.lineTo(x,y):ctx.moveTo(x,y)});ctx.stroke();ctx.setLineDash([]);}
@@ -796,6 +910,9 @@ function drawSpark(){sc.clearRect(0,0,sp.width,sp.height);line(sc,sp,sH,FG,Math.
 function drawChart(){cc.clearRect(0,0,ch.width,ch.height);
  line(cc,ch,wH,FG,Math.max(...wH,1));       // writes/s (white)
  line(cc,ch,pH,TEAL,Math.max(...pH,2));}     // read p99 (ScyllaDB teal, own scale)
+function drawAnn(){anc.clearRect(0,0,an.width,an.height);
+ line(anc,an,aqH,FG,Math.max(...aqH,1));     // ANN queries/s (white)
+ line(anc,an,aH,TEAL,Math.max(...aH,2));}    // ANN p99 (teal, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
 function doBurst(){fetch('/burst',{method:'POST'});}
 // --- write-amplification flow: fills (white) split into writes (teal) ---
@@ -960,6 +1077,13 @@ ws.onmessage=e=>{const s=JSON.parse(e.data);
  document.getElementById('burst').className=s.bursting?'burston':'';
  sH.push(s.fills_per_s); wH.push(s.writes_per_s); pH.push(s.read_p99_ms);
  [sH,wH,pH].forEach(a=>{if(a.length>120)a.shift()}); drawSpark(); drawChart();
+ // vector-search panel: hidden unless the prober fleet is running
+ if(s.ann_qps===undefined){vscard.style.display='none';}else{vscard.style.display='';
+  annp99.textContent=s.ann_p99_ms.toFixed(2); annp99b.textContent=s.ann_p99_ms.toFixed(2);
+  annp50.textContent=s.ann_p50_ms.toFixed(2); annqps.textContent=fmt(s.ann_qps);
+  annconc.textContent=s.ann_conc; annk.textContent=s.ann_k; annempty.textContent=s.ann_empty;
+  aH.push(s.ann_p99_ms); aqH.push(s.ann_qps);
+  [aH,aqH].forEach(a=>{if(a.length>120)a.shift()}); drawAnn();}
  // write-load skew bars (monochrome)
  const hmx=Math.max(...s.hot.map(h=>h.vol),1);
  hot.innerHTML=s.hot.map(h=>`<div class=row><span class=coin>${h.coin}</span>`+
