@@ -5,11 +5,8 @@ audience already met in webinar 1, so a neighbour list is *explainable* on
 stage ("these two wallets are close because same directionality, same size
 class, same hours"). Learned sequence embeddings are the upgrade path.
 
-Two vectors:
+One vector:
   * wallet_vector : 16-dim behavioural fingerprint of a wallet
-  * coin_vector   : 15-dim live flow signature of a coin
-                    ([volume, imbalance, hhi, smart_flow, active_wallets]
-                     x [1m, 5m, 1h])
 
 All dimensions are squashed into [0, 1] (log-scale where values span orders
 of magnitude) and compared with COSINE similarity — see cql/schema_vector.cql.
@@ -20,7 +17,6 @@ from __future__ import annotations
 import math
 
 WALLET_DIM = 16
-COIN_DIM = 15
 
 # stage-friendly names, index-aligned with wallet_vector()
 WALLET_DIM_NAMES = [
@@ -79,24 +75,6 @@ def wallet_vector(w) -> list[float]:
     if total_h:
         for i in range(4):
             v[12 + i] = sum(w.hours[i * 6:(i + 1) * 6]) / total_h
-    return v
-
-
-def coin_vector(snaps: dict[str, dict]) -> list[float]:
-    """Flow signature of a coin from its window snapshots ({'1m': snap, ...}).
-    Missing windows contribute neutral values so early-stream vectors are
-    still comparable."""
-    v: list[float] = []
-    for win in ("1m", "5m", "1h"):
-        s = snaps.get(win)
-        if not s:
-            v.extend([0.0, 0.5, 0.0, 0.5, 0.0])
-            continue
-        v.append(_log01(s["volume"], 1e9))
-        v.append(0.5 * (s["buy_sell_imbalance"] + 1.0))
-        v.append(min(max(s["hhi"], 0.0), 1.0))
-        v.append(_signed_log01(s["smart_flow"], 1e8))
-        v.append(_log01(s["active_wallets"], 1e5))
     return v
 
 

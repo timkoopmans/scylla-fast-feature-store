@@ -153,7 +153,7 @@ def read_bench(args):
 # --------------------------------------------------------------------------- #
 # ANN benchmark — load-tests the vector index, not the feature fast path
 # --------------------------------------------------------------------------- #
-def _load_seed_vectors(profile, limit):
+def _load_seed_vectors(profile, limit, index="wallet-coin"):
     """Pull a pool of real wallet embeddings to use as query points.
 
     Done ONCE in the parent and handed to the workers, so no worker pays a
@@ -161,14 +161,15 @@ def _load_seed_vectors(profile, limit):
     """
     cluster = make_cluster(profile, "tuned")
     session = cluster.connect(KEYSPACE)
-    stmt = f"SELECT embedding FROM wallet_features LIMIT {limit}"
+    tbl = "wallet_coin_features" if index == "wallet-coin" else "wallet_features"
+    stmt = f"SELECT embedding FROM {tbl} LIMIT {limit}"
     seeds = [list(r.embedding) for r in session.execute(stmt) if r.embedding]
     session.shutdown()
     cluster.shutdown()
     return seeds
 
 
-def _ann_worker(profile, tuning, seeds, n_per_proc, threads, k, wid, out_q):
+def _ann_worker(profile, tuning, seeds, n_per_proc, threads, k, wid, out_q, index="wallet-coin"):
     """One process: `threads` synchronous ANN queries sharing a session.
 
     Deliberately NOT similar_wallets() — that does a seed point-read plus k
@@ -182,7 +183,7 @@ def _ann_worker(profile, tuning, seeds, n_per_proc, threads, k, wid, out_q):
         out_q.put({"lat": [], "empty": 0, "short": 0, "err": 0, "elapsed": 0.0,
                    "fatal": "vector schema not applied"})
         return
-    stmt = vps["ann_wallets"]
+    stmt = vps["ann_wallet_coins" if index == "wallet-coin" else "ann_wallets"]
     nseeds = len(seeds)
 
     for v in seeds[: min(200, nseeds)]:   # warm the connection pool
@@ -238,7 +239,7 @@ def _ann_worker(profile, tuning, seeds, n_per_proc, threads, k, wid, out_q):
 
 
 def ann_bench(args):
-    seeds = _load_seed_vectors(args.profile, args.seeds)
+    seeds = _load_seed_vectors(args.profile, args.seeds, args.index)
     if not seeds:
         raise SystemExit("no wallet embeddings found — run the consumer first")
     print(f"seed pool: {len(seeds):,} vectors")
@@ -250,7 +251,7 @@ def ann_bench(args):
         ctx.Process(
             target=_ann_worker,
             args=(args.profile, args.tuning, seeds, n_per_proc, args.threads,
-                  args.k, w, q),
+                  args.k, w, q, args.index),
         )
         for w in range(args.procs)
     ]
@@ -308,6 +309,9 @@ def main():
     a.add_argument("--procs", type=int, default=12)
     a.add_argument("--threads", type=int, default=8)
     a.add_argument("--k", type=int, default=10)
+    a.add_argument("--index", default="wallet-coin",
+                   choices=["wallet-coin", "wallet"],
+                   help="which ANN index to search (wallet-coin is 4.4x larger)")
     a.add_argument("--seeds", type=int, default=5_000,
                    help="size of the query-vector pool sampled from the table")
 

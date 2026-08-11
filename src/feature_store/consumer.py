@@ -21,7 +21,7 @@ import time
 from datetime import timezone
 
 from .config import make_cluster, KEYSPACE
-from .embeddings import coin_vector, wallet_vector
+from .embeddings import wallet_vector
 from .features import FeatureEngine
 from .replay import replay
 from .statements import prepare_all, prepare_vector
@@ -56,14 +56,12 @@ def run(args) -> None:
 
     def flush_wallets_and_open_windows():
         # coin window open snapshots (freshness)
-        coin_snaps: dict[str, dict[str, dict]] = {}
         for coin, win, snap in engine.open_snapshots():
             pipe.execute(ps["coin_window"], (
                 coin, win, _ts(snap["bucket_ts"] * 1000), snap["volume"],
                 snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
                 snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"],
             ))
-            coin_snaps.setdefault(coin, {})[win] = snap
         # wallet features (coalesced full flush of all known wallets); the
         # behaviour embedding rides IN the same upsert — one mutation, one CDC
         # row image with the vector, and the ANN index stays fresh from there.
@@ -74,10 +72,6 @@ def run(args) -> None:
                 pipe.execute(vps["wallet_vec"], row + (wallet_vector(w),))
             else:
                 pipe.execute(ps["wallet"], row)
-        if vps:
-            now = dt.datetime.now(UTC)
-            for coin, snaps in coin_snaps.items():
-                pipe.execute(vps["coin_flow"], (coin, coin_vector(snaps), now))
 
     for f in replay(speed=args.speed, limit_days=args.days, max_fills=args.max_fills):
         wc, w, closed = engine.apply(f)

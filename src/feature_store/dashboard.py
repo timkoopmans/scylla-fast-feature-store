@@ -44,7 +44,7 @@ from fastapi.responses import HTMLResponse
 os.environ.setdefault("POLARS_MAX_THREADS", "2")
 
 from .config import KEYSPACE, make_cluster
-from .embeddings import coin_vector, cosine, wallet_vector
+from .embeddings import cosine, wallet_vector
 from .features import FeatureEngine, WalletState
 from .replay import iter_fills
 from .scorer import unusual_accumulation
@@ -85,6 +85,12 @@ BLAST_EMB_EVERY = int(os.environ.get("FS_BLAST_EMB_EVERY", "20000"))
 ANN_PROCS = int(os.environ.get("FS_ANN_PROCS", "0"))
 ANN_THREADS = int(os.environ.get("FS_ANN_THREADS", "10"))
 ANN_K = int(os.environ.get("FS_ANN_K", "10"))
+# Which ANN index the probers search: "wallet-coin" (981k vectors, the realistic
+# population) or "wallet" (224k — one row per wallet is all the data allows).
+ANN_INDEX = os.environ.get("FS_ANN_INDEX", "wallet-coin")
+# Behaviour-vector writes start ON or OFF; flipped live by the EMBEDDINGS button
+# (POST /embeddings). OFF keeps the index quiescent for the low-p99 beat.
+EMBED_ON_DEFAULT = os.environ.get("FS_EMBED_ON", "0") not in ("0", "false", "off")
 
 app = FastAPI(title="ScyllaDB feature store — live")
 
@@ -185,12 +191,6 @@ def _ingest_proc(shared, base_speed, days, profile):
                 wallet_vector(w),
             ))
         dirty.clear()
-        coin_snaps: dict[str, dict[str, dict]] = {}
-        for coin, win, snap in engine.open_snapshots():
-            coin_snaps.setdefault(coin, {})[win] = snap
-        now_utc = dt.datetime.now(UTC)
-        for coin, snaps in coin_snaps.items():
-            pipe.execute(vps["coin_flow"], (coin, coin_vector(snaps), now_utc))
 
     for f in iter_fills(limit_days=days):
         now = time.monotonic()
@@ -251,7 +251,12 @@ def _ingest_proc(shared, base_speed, days, profile):
             flush_open()
             last_flush = now
         if vps and now - last_emb >= EMB_FLUSH_SECS:
-            flush_embeddings()
+            # gated by the live EMBEDDINGS toggle: skipping the flush leaves the
+            # ANN index quiescent, which is what keeps the p99 single-digit
+            if shared.get("embed_on", False):
+                flush_embeddings()
+            else:
+                dirty.clear()   # don't accumulate a backlog while paused
             last_emb = now
         if now - last_t >= 0.5:
             dt_s = now - last_t
@@ -376,7 +381,7 @@ def _blaster_proc(wid, nblast, days, profile, max_inflight, burst_only, shared,
                     w = states[addr] = WalletState()
                 w.update(Fill(addr, coin, px, sz, side, t_ms, cpnl, crossed))
                 dirty.add(addr)
-                if fc % BLAST_EMB_EVERY == 0:
+                if fc % BLAST_EMB_EVERY == 0 and shared.get("embed_on", False):
                     # one upsert carrying features + vector -> one CDC row
                     # image the Vector Store picks up (see UPSERT_WALLET_VEC)
                     for a in dirty:
@@ -418,12 +423,13 @@ def _ann_prober_proc(wid, nthreads, profile, k, shared):
     vps = prepare_vector(session)
     if vps is None:
         return
+    tbl = "wallet_coin_features" if ANN_INDEX == "wallet-coin" else "wallet_features"
     seeds = [list(r.embedding) for r in
-             session.execute("SELECT embedding FROM wallet_features LIMIT 5000")
+             session.execute(f"SELECT embedding FROM {tbl} LIMIT 5000")
              if r.embedding]
     if not seeds:
         return
-    stmt = vps["ann_wallets"]
+    stmt = vps["ann_wallet_coins" if ANN_INDEX == "wallet-coin" else "ann_wallets"]
     key = f"ann_{wid}"
     lock = threading.Lock()
     samples: deque = deque(maxlen=400)
@@ -559,6 +565,7 @@ def _reader_thread(shared):
                 STATS["ann_empty"] = ann_empty
                 STATS["ann_conc"] = ANN_PROCS * ANN_THREADS
                 STATS["ann_k"] = ANN_K
+                STATS["ann_index"] = ANN_INDEX
             STATS["scoreboard"] = board
             STATS["hot"] = sorted(hot, key=lambda x: x["vol"], reverse=True)
             STATS["fills_total"] = snap.get("fills_total", 0)
@@ -571,6 +578,7 @@ def _reader_thread(shared):
             STATS["seeds"] = dict(snap.get("seeds", {}))
             STATS["vector_on"] = _proc.get("vps") is not None
             STATS["bursting"] = bool(snap.get("bursting", False))
+            STATS["embed_on"] = bool(snap.get("embed_on", False))
             STATS["fresh_us"] = round(fresh_us, 1)
             dm = snap.get("data_time_ms")
             STATS["data_time"] = _ts(dm).isoformat() if dm else None
@@ -589,6 +597,7 @@ def _startup():
     shared["hot"] = []
     shared["speed"] = SPEED
     shared["burst_until"] = 0.0
+    shared["embed_on"] = EMBED_ON_DEFAULT
     p = ctx.Process(
         target=_ingest_proc, args=(shared, SPEED, DAYS, PROFILE), daemon=True
     )
@@ -649,6 +658,20 @@ def burst(secs: float = BURST_SECS):
     """Spike replay to max speed for `secs` — drives a write burst on demand."""
     _proc["shared"]["burst_until"] = time.time() + secs
     return {"bursting_for_s": secs}
+
+
+@app.post("/embeddings")
+def embeddings_toggle(on: bool | None = None):
+    """Turn behaviour-vector writes on/off live.
+
+    The stage beat: with embeddings OFF the index is quiescent and ANN holds a
+    single-digit p99; flip them ON and CDC re-indexing starts, which is what
+    actually moves the ANN tail (write volume alone does not). Lets the audience
+    watch the trade-off happen instead of taking it on trust.
+    """
+    sh = _proc["shared"]
+    sh["embed_on"] = (not sh.get("embed_on", False)) if on is None else bool(on)
+    return {"embed_on": sh["embed_on"]}
 
 
 @app.get("/stats")
@@ -836,8 +859,11 @@ HTML = """
     <div class=row><span class=sub>writes/s</span><b id=wps>0</b></div>
   </div>
   <div class=card id=vscard style=grid-column:1/3>
-    <div class=sub>ScyllaDB Vector Search <span class=legend>ANN over the whole wallet
-      population — <b>same cluster, same CQL session</b> as the point reads above</span></div>
+    <div class=sub style=display:flex;align-items:center;gap:10px>
+      <span>ScyllaDB Vector Search <span class=legend>ANN over the whole wallet
+      population — <b>same cluster, same CQL session</b> as the point reads above</span></span>
+      <button id=embtog onclick=toggleEmb() style=margin-left:auto>EMBEDDINGS —</button>
+    </div>
     <div class=big><span id=annp99>—</span><span class=unit> ms ANN p99</span>
       <span class=legend><b style=color:#2bd6c6>● ANN p99 (ms)</b> &nbsp;<b style=color:#e4e4e7>● ANN queries/s</b></span></div>
     <canvas id=annchart width=1130 height=52></canvas>
@@ -915,6 +941,9 @@ function drawAnn(){anc.clearRect(0,0,an.width,an.height);
  line(anc,an,aH,TEAL,Math.max(...aH,2));}    // ANN p99 (teal, own scale)
 function fmt(n){return n>=1000?(n/1000).toFixed(1)+'k':Math.round(n)}
 function doBurst(){fetch('/burst',{method:'POST'});}
+// live embedding-write toggle: ON starts CDC re-indexing (watch the ANN tail
+// climb); OFF leaves the index quiescent for the single-digit-p99 beat.
+function toggleEmb(){fetch('/embeddings',{method:'POST'});}
 // --- write-amplification flow: fills (white) split into writes (teal) ---
 const am=document.getElementById('amp'),ac=am.getContext('2d');
 let liveFps=0,liveWps=0,parts=[],spawnAcc=0,lastT=performance.now();
@@ -1074,6 +1103,8 @@ ws.onmessage=e=>{const s=JSON.parse(e.data);
  liveFps=s.fills_per_s;liveWps=s.writes_per_s;
  ampx.textContent='× '+Math.round(s.writes_per_s/Math.max(s.fills_per_s,1))+' write amplification';
  burststate.textContent=s.bursting?'BURSTING':'steady';
+ if(s.embed_on!==undefined){embtog.textContent='EMBEDDINGS '+(s.embed_on?'ON':'OFF');
+  embtog.className=s.embed_on?'burston':'';}
  document.getElementById('burst').className=s.bursting?'burston':'';
  sH.push(s.fills_per_s); wH.push(s.writes_per_s); pH.push(s.read_p99_ms);
  [sH,wH,pH].forEach(a=>{if(a.length>120)a.shift()}); drawSpark(); drawChart();

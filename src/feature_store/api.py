@@ -101,14 +101,6 @@ def similar_wallet(addr: str, k: int = 10):
     return out
 
 
-@app.get("/similar/coin/{coin}")
-def similar_coin(coin: str, k: int = 5):
-    out = similarity.similar_coins(_state["session"], _state["ps"], _vps(), coin, k)
-    if out is None:
-        raise HTTPException(404, "no flow vector for coin")
-    return out
-
-
 def _env(k, d):
     import os
 

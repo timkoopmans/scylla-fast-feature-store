@@ -7,13 +7,13 @@
 -- service, USearch/HNSW) is kept fresh from the base table via CDC — no second
 -- database, no app-level sync pipeline.
 --
--- Dimensions must match feature_store/embeddings.py (WALLET_DIM / COIN_DIM).
+-- Dimensions must match feature_store/embeddings.py (WALLET_DIM).
 -- ============================================================================
 
 USE feature_store;
 
 -- ----------------------------------------------------------------------------
--- 1) Per-wallet behaviour embedding, stored NEXT TO the wallet features.
+-- Per-wallet behaviour embedding, stored NEXT TO the wallet features.
 --    Hand-crafted + normalized (explainable on stage): directionality, maker
 --    share, taker-buy bias, activity scale, coin diversity/concentration,
 --    PnL profile, archetype, hours-of-day profile. Similar wallets — similar
@@ -31,18 +31,19 @@ USING 'vector_index'
 WITH OPTIONS = { 'similarity_function': 'COSINE' };
 
 -- ----------------------------------------------------------------------------
--- 2) Per-coin flow-signature embedding: rolling
---    [volume, imbalance, hhi, smart_flow, active_wallets] x [1m, 5m, 1h].
---    One row per coin (live overwrite) -> "which coins look like COIN right
---    now" is one ANN query over a small, always-fresh table.
+-- Per (wallet, coin) behaviour embedding — the SAME 16-dim fingerprint, scoped
+-- to one wallet's activity in one coin ("how does this wallet trade BTC?").
+--
+-- Why both: the wallet index answers "who trades like this wallet"; this one
+-- answers "which wallet-coin books behave alike", and it is 4.4x larger —
+-- 981k pairs vs 224k wallets on the 46-day dataset — so it is what gives the
+-- index a realistic population. Dims 5/6 (coin diversity / top-coin share) are
+-- constant here by construction; kept anyway so ONE embedding function serves
+-- both scopes rather than forking the canonical code.
 -- ----------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS coin_flow_vectors (
-    coin        text PRIMARY KEY,
-    embedding   vector<float, 15>,
-    updated_ts  timestamp
-) WITH compaction = {'class': 'IncrementalCompactionStrategy'};
+ALTER TABLE wallet_coin_features ADD (embedding vector<float, 16>);
 
-CREATE CUSTOM INDEX IF NOT EXISTS coin_flow_embedding_idx
-ON coin_flow_vectors (embedding)
+CREATE CUSTOM INDEX IF NOT EXISTS wallet_coin_embedding_idx
+ON wallet_coin_features (embedding)
 USING 'vector_index'
 WITH OPTIONS = { 'similarity_function': 'COSINE' };

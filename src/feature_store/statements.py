@@ -40,13 +40,15 @@ READ_WALLET = "SELECT * FROM wallet_features WHERE addr=?"
 # The embedding is written IN THE SAME upsert as the features: one mutation ->
 # one CDC row image that always carries the vector (the Vector Store skips CDC
 # rows without one), and half the writes vs a separate SET embedding UPDATE.
+UPSERT_WALLET_COIN_VEC = """
+INSERT INTO wallet_coin_features
+  (addr, coin, net_pos, avg_entry, realized_pnl, fill_count, last_ts, embedding)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+"""
 UPSERT_WALLET_VEC = """
 INSERT INTO wallet_features
   (addr, cum_realized_pnl, total_fills, gross_volume, net_volume, churn, archetype, last_ts, embedding)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-"""
-UPSERT_COIN_FLOW = """
-INSERT INTO coin_flow_vectors (coin, embedding, updated_ts) VALUES (?, ?, ?)
 """
 
 # The whole webinar in two statements: an ANN neighbour lookup and the same
@@ -54,10 +56,11 @@ INSERT INTO coin_flow_vectors (coin, embedding, updated_ts) VALUES (?, ?, ?)
 ANN_WALLETS = (
     "SELECT addr FROM wallet_features ORDER BY embedding ANN OF ? LIMIT ?"
 )
-ANN_COINS = (
-    "SELECT coin FROM coin_flow_vectors ORDER BY embedding ANN OF ? LIMIT ?"
+# The larger population: one vector per (wallet, coin) rather than per wallet —
+# 981k vs 224k on the 46-day dataset, so this is the realistic index to search.
+ANN_WALLET_COINS = (
+    "SELECT addr, coin FROM wallet_coin_features ORDER BY embedding ANN OF ? LIMIT ?"
 )
-READ_COIN_FLOW = "SELECT * FROM coin_flow_vectors WHERE coin=?"
 
 
 def prepare_all(session) -> dict:
@@ -81,10 +84,9 @@ def prepare_vector(session) -> dict | None:
     try:
         return {
             "wallet_vec": session.prepare(UPSERT_WALLET_VEC),
-            "coin_flow": session.prepare(UPSERT_COIN_FLOW),
+            "wallet_coin_vec": session.prepare(UPSERT_WALLET_COIN_VEC),
             "ann_wallets": session.prepare(ANN_WALLETS),
-            "ann_coins": session.prepare(ANN_COINS),
-            "read_coin_flow": session.prepare(READ_COIN_FLOW),
+            "ann_wallet_coins": session.prepare(ANN_WALLET_COINS),
         }
     except InvalidRequest:
         return None

@@ -68,29 +68,6 @@ def similar_wallets(session, ps, vps, addr: str, k: int = 10) -> dict | None:
     }
 
 
-def similar_coins(session, ps, vps, coin: str, k: int = 5) -> dict | None:
-    """Coins whose live flow signature looks like this coin's, right now."""
-    seed = _row(session.execute(vps["read_coin_flow"], (coin,)))
-    if not seed or seed.get("embedding") is None:
-        return None
-    seed_vec = list(seed["embedding"])
-
-    t0 = time.perf_counter()
-    rows = session.execute(vps["ann_coins"], (seed_vec, k + 1))
-    coins = [r.coin for r in rows if r.coin != coin][:k]
-    ann_ms = (time.perf_counter() - t0) * 1000.0
-
-    neighbours = []
-    for c in coins:
-        row = _row(session.execute(vps["read_coin_flow"], (c,)))
-        if not row:
-            continue
-        vec = list(row.pop("embedding") or [])
-        neighbours.append({"coin": c, "cosine": round(cosine(seed_vec, vec), 4),
-                           "updated_ts": str(row.get("updated_ts"))})
-    return {"coin": coin, "neighbours": neighbours, "ann_ms": round(ann_ms, 2)}
-
-
 def _smoke(session, ps, vps, k: int) -> int:
     """End-to-end sanity: grab any wallet with an embedding and any coin
     vector, run both similarity lenses, print the results."""
@@ -106,21 +83,13 @@ def _smoke(session, ps, vps, k: int) -> int:
     print(f"smoke: seed wallet {seed_addr}")
     out = similar_wallets(session, ps, vps, seed_addr, k)
     print(json.dumps(out, indent=2, default=str))
-
-    row = session.execute("SELECT coin FROM coin_flow_vectors LIMIT 1").one()
-    if row:
-        print(f"\nsmoke: seed coin {row.coin}")
-        print(json.dumps(similar_coins(session, ps, vps, row.coin, k),
-                         indent=2, default=str))
-    else:
-        print("smoke: no coin flow vectors yet")
     return 0
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["wallet", "coin", "smoke"])
-    ap.add_argument("id", nargs="?", help="wallet address or coin symbol")
+    ap.add_argument("mode", choices=["wallet", "smoke"])
+    ap.add_argument("id", nargs="?", help="wallet address")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--profile", default=os.environ.get("FS_PROFILE", "local"),
                     choices=["local", "cloud"])
@@ -137,9 +106,8 @@ def main():
         if args.mode == "smoke":
             raise SystemExit(_smoke(session, ps, vps, args.k))
         if not args.id:
-            raise SystemExit("wallet/coin mode needs an id argument")
-        fn = similar_wallets if args.mode == "wallet" else similar_coins
-        out = fn(session, ps, vps, args.id, args.k)
+            raise SystemExit("wallet mode needs an id argument")
+        out = similar_wallets(session, ps, vps, args.id, args.k)
         if out is None:
             raise SystemExit(f"no embedding for {args.mode} {args.id}")
         print(json.dumps(out, indent=2, default=str))
