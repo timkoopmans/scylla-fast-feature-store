@@ -1,0 +1,52 @@
+# Laptop-friendly single-node ScyllaDB + Vector Store for webinar-2 iteration.
+# Light load ONLY (--smp 2 --memory 2G) — the real demo runs on ScyllaDB Cloud.
+#
+#   docker compose -f docker/docker-compose.local.yml -p fslocal up -d
+#
+# Unlike the 3-node demo-host setup (docker-compose.yml), the app connects via
+# localhost:9042 (macOS can't reach container bridge IPs), so run clients with
+# FS_CONTACT_POINTS=127.0.0.1 — the `local-*` just recipes set this for you.
+
+name: fslocal
+
+services:
+  scylla:
+    image: scylladb/scylla:2026.1.5
+    container_name: fslocal-scylla
+    command: >
+      --smp 2
+      --memory 2G
+      --overprovisioned 1
+      --developer-mode 1
+      --api-address 0.0.0.0
+      --vector-store-primary-uri http://vector-store:6080
+      --broadcast-rpc-address 127.0.0.1
+    ports:
+      - "9042:9042"
+      - "9180:9180"
+    networks:
+      - scylla-net
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'DESCRIBE KEYSPACES' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  vector-store:
+    image: scylladb/vector-store:1.7.0
+    container_name: fslocal-vector
+    environment:
+      VECTOR_STORE_URI: "0.0.0.0:6080"
+      VECTOR_STORE_SCYLLADB_URI: "scylla:9042"
+    ports:
+      - "6080:6080"
+    networks:
+      - scylla-net
+    depends_on:
+      scylla:
+        condition: service_healthy
+
+networks:
+  scylla-net:
+    driver: bridge

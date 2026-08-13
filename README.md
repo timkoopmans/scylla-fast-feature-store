@@ -8,6 +8,27 @@ feature retrieval is the thing we showcase.
 Measured numbers: [`docs/RESULTS.md`](docs/RESULTS.md) ·
 Why this dataset: [`docs/DATASET.md`](docs/DATASET.md)
 
+## Webinar 2 — same engine, plus vector search
+
+Webinar 2 collapses a second specialised database: the same ScyllaDB that
+serves feature point-reads also answers **ANN similarity queries** over
+hand-crafted behaviour embeddings, kept fresh from the base tables via CDC
+(ScyllaDB's Vector Store service — no external vector DB, no sync ETL).
+
+- `embeddings.py` — explainable 16-dim **wallet behaviour fingerprint**
+  (directionality, maker share, size/activity class, coin diversity, PnL,
+  archetype, hours profile) written **in the same upsert** as the features.
+- `similarity.py` + `/similar/wallet/{addr}` —
+  `ORDER BY embedding ANN OF` neighbour lookup, then the webinar-1 point-read
+  for each neighbour: *one engine, two query types*. Includes a first-cut
+  coordinated-ring heuristic (abnormally tight neighbour clusters).
+- `vecgen.py` — bulk backfill of the whole dataset's wallet vectors (385M fills
+  -> 224k wallets in seconds, via vectorized aggregates).
+- `cql/schema_vector.cql` — embedding column + the `vector_index` ANN index.
+- Local iteration (light load): `just local-up local-demo` (single node +
+  vector-store via `docker/docker-compose.local.yml`); the webinar itself runs
+  on ScyllaDB Cloud with Vector Search enabled.
+
 ## What it does
 
 ```

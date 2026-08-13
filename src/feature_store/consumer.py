@@ -21,9 +21,10 @@ import time
 from datetime import timezone
 
 from .config import make_cluster, KEYSPACE
+from .embeddings import wallet_vector
 from .features import FeatureEngine
 from .replay import replay
-from .statements import prepare_all
+from .statements import prepare_all, prepare_vector
 from .writer import Pipeline
 
 UTC = timezone.utc
@@ -38,6 +39,10 @@ def run(args) -> None:
     cluster = make_cluster(args.profile, args.tuning)
     session = cluster.connect(KEYSPACE)
     ps = prepare_all(session)
+    vps = prepare_vector(session) if args.embeddings == "on" else None
+    if args.embeddings == "on" and vps is None:
+        print("[consume] vector schema not applied (cql/schema_vector.cql) — "
+              "embeddings disabled", flush=True)
     pipe = Pipeline(session, max_inflight=args.max_inflight)
     engine = FeatureEngine()
 
@@ -57,12 +62,16 @@ def run(args) -> None:
                 snap["taker_buy"], snap["taker_sell"], snap["buy_sell_imbalance"],
                 snap["active_wallets"], snap["hhi"], snap["large_flow"], snap["smart_flow"],
             ))
-        # wallet features (coalesced full flush of all known wallets)
+        # wallet features (coalesced full flush of all known wallets); the
+        # behaviour embedding rides IN the same upsert — one mutation, one CDC
+        # row image with the vector, and the ANN index stays fresh from there.
         for addr, w in engine.wallets.items():
-            pipe.execute(ps["wallet"], (
-                addr, w.cum_realized_pnl, w.total_fills, w.gross_volume,
-                abs(w.signed_volume), w.churn, w.archetype, _ts(w.last_ts),
-            ))
+            row = (addr, w.cum_realized_pnl, w.total_fills, w.gross_volume,
+                   abs(w.signed_volume), w.churn, w.archetype, _ts(w.last_ts))
+            if vps:
+                pipe.execute(vps["wallet_vec"], row + (wallet_vector(w),))
+            else:
+                pipe.execute(ps["wallet"], row)
 
     for f in replay(speed=args.speed, limit_days=args.days, max_fills=args.max_fills):
         wc, w, closed = engine.apply(f)
@@ -146,6 +155,8 @@ def main():
     ap.add_argument("--days", type=int, default=1, help="number of day files")
     ap.add_argument("--max-fills", type=int, default=None)
     ap.add_argument("--raw-sink", default="off", choices=["off", "bucket", "hot"])
+    ap.add_argument("--embeddings", default="on", choices=["on", "off"],
+                    help="write wallet/coin behaviour vectors on each flush")
     ap.add_argument("--max-inflight", type=int, default=4096)
     ap.add_argument("--flush-secs", type=float, default=2.0)
     ap.add_argument("--sample-out", default="sample_keys.csv")

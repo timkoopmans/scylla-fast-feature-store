@@ -137,6 +137,170 @@ is a larger multiple.) The dashboard also shows per-coin write-load skew (BTC/ET
 HYPE dominate — motivates partition-key design), taker buy/sell imbalance per coin,
 and the live wallet-archetype mix (market-maker / directional / mixed).
 
+## Vector search (webinar 2) — ANN on the same cluster
+
+Measured 2026-08-11 against **ScyllaDB Cloud**, `AWS_US_EAST_1`, RF=3:
+**3 × i8g.2xlarge Data Store** + **2 × r7g.xlarge Vector Search**. Client: one
+48-vCPU ARM EC2 box, same region.
+
+### How these numbers are measured (this section differs from the rest)
+
+Everything above is **client-observed**. That breaks down here: driving ~100k
+writes/s from Python needs ~20 processes, and any latency probe running on the
+same box then competes with them for CPU and reports its own queuing as database
+latency. At 137k writes/s the client-side read p99 read 13.5 ms while the
+cluster itself was serving 5-8 ms.
+
+So the numbers below come from the cluster's own metrics, via the **ScyllaDB
+Cloud Prometheus proxy** (`Actions > Enable Cluster Metrics`), scraped by
+`cloudmetrics.py`:
+
+- `scylla_storage_proxy_coordinator_{read,write}_latency` (scheduling group
+  `sl:default` — user workload, not gossip/compaction)
+- the Vector Store's own `request_latency_seconds`, `index_size`,
+  `index_modified`
+
+Three properties worth knowing before quoting them:
+
+- **They answer "what did the database do", not "what did the app see."**
+  Server-side latency excludes network RTT and client queuing. A single ANN
+  query measured 1.87 ms client-side while the Vector Store recorded 140 µs for
+  the same work — both true, ~93% of the client-observed time is transport.
+- **Percentiles are windowed and interpolated.** The exported histograms are
+  cumulative since node start, so `cloudmetrics` differences two scrapes and
+  interpolates within the bucket exactly as Prometheus `histogram_quantile`
+  does. Returning the bucket's upper bound instead reported 10.00 ms where
+  Grafana showed 6.91 ms on identical data.
+- **The floor is a 20 s cadence.** ScyllaDB Cloud collects on a fixed ~20 s
+  interval (verified: sample timestamps step in exactly 20,000 ms), so polling
+  the proxy faster returns byte-identical samples. The node exporters (9180 /
+  9100) are not reachable — Cloud exposes only 9042 and the metrics proxy. The
+  dashboard therefore draws sparkline *shape* from its own client-side stream
+  (~3/s) and prints server-measured *numbers* beside them.
+
+### Load model: an exchange simulator, not blasters
+
+The webinar-1 "blasters" preload one slice of day 1 and re-upsert it forever:
+high ops/s, but the same keys, so the wallet population never grows and no
+vector ever changes. `_sim_proc` instead shards the **46 day files** across
+workers and streams each day once, computing real features and real behaviour
+vectors as it goes — genuine exchange traffic over the whole population.
+
+For scale: the real exchange runs ~60-97 fills/s (385M fills / 46 days), so a
+production deployment of this system is ~300-500 writes/s. The configuration
+below is roughly **200× production traffic**.
+
+### Index population (`vecgen`)
+
+Two streaming polars group-bys turn 385M fills into per-entity aggregates in
+seconds, then one upsert each — reusing `WalletState` and `wallet_vector()`, so
+the backfilled vectors are identical to what the streaming path produces.
+
+| scope | entities | aggregate time | write time |
+|---|---|---|---|
+| per wallet | 224,135 | 5.7 s | 61 s (3,649/s) |
+| **per (wallet, coin)** | **981,366** | 3.4 s | 204 s (4,802/s) |
+
+Both are dataset **ceilings**, not samples. Only 47,162 distinct wallets trade
+on day 1 and ~12k genuinely new ones appear per additional day, saturating at
+224,135 — a bigger *wallet* index is not possible from this data. The
+(wallet, coin) grain is 4.4× larger and is what the demo searches.
+
+### Demo configuration — single digit across the board
+
+```
+FS_SIM_PROCS=20  FS_DAYS=46  FS_EMBED_ON=0
+FS_ANN_PROCS=4   FS_ANN_THREADS=4   FS_ANN_INDEX=wallet-coin
+```
+
+| metric (server-measured) | value |
+|---|---|
+| coordinator write ops/s | **83k-114k** |
+| write p99 | **3.58-4.28 ms** |
+| read p99 | **6.59-7.17 ms** |
+| ANN p99 (in the Vector Store) | **0.50-4.75 ms** |
+| ANN queries/s | 2.8k-3.9k |
+| vectors searched | **981,366** |
+| empty / short ANN results | 0 |
+
+**Headline:** one cluster sustaining ~100k coordinator writes/s of real exchange
+traffic while answering thousands of ANN queries/s over ~1M vectors, with every
+tail in single-digit milliseconds — no second database, no sync ETL.
+
+**Ceiling:** 36 sim procs reach ~137k write ops/s, but the cluster's own write
+p99 goes to **40.96 ms** and read p99 to 57.3 ms. ~85-115k is this cluster's
+single-digit envelope with the vector index live.
+
+### What CDC costs
+
+Creating a vector index enables CDC on the base table. Same 20-process load,
+same ~83.5k coordinator write ops/s, only the index differs:
+
+| | write p99 | read p99 |
+|---|---|---|
+| `wallet_coin_embedding_idx` present | 3.584 ms | 7.168 ms |
+| index dropped | **2.048 ms** | **3.072 ms** |
+
+**~1.75× on write tail, ~2.3× on read tail.** Reads suffer more: the Vector
+Store is concurrently *reading* the CDC log back out while it competes with
+user reads. (The log table survives the index drop — CDC stays enabled until
+`ALTER TABLE ... WITH cdc = {'enabled': false}`; latency recovered because
+nothing was consuming it.)
+
+This also reconciles the dashboard with the Cloud's Grafana, which report
+different layers:
+
+| | |
+|---|---|
+| coordinator writes (what the app issued) | 88.4k/s |
+| × RF=3 → base-table replica writes | 265.2k/s |
+| CDC operations | 96.2k/s (≈1 per base write) |
+| × RF=3 → CDC-log replica writes | 288.6k/s |
+| **replica writes (what storage did)** | **≈554k/s** (Grafana: 563k) |
+
+So the storage layer does **~6.4× the application's write count** — `RF × (base
++ CDC)`. That is the price of an always-fresh vector index with no ETL, and at
+production rates it is unmeasurable.
+
+### Three findings that were counter to the obvious guess
+
+- **Index size costs nothing.** Settled at 224k vectors the index served p99
+  3.909 ms; at 33k it served 3.690 ms; at 981k, 4.5-4.75 ms. What *did* cost
+  7.27 ms was querying an index still digesting a backfill — a transient, not a
+  size effect.
+- **Raw write volume is nearly free to the ANN path; embedding writes are not.**
+  71k vs 132k writes/s moved ANN latency not at all. But *any* active
+  re-indexing put ANN into a ~12 ms p50 regime, and one embedding writer cost as
+  much as four — switch-like, not proportional. Even the paced ingest's 2 s
+  flush held p99 at 13.4 ms while leaving p50 at 1.9 ms. Hence the EMBEDDING
+  WRITES toggle: the "fresh vectors" beat and the "low ANN tail" beat cannot
+  share a moment, and there is no useful middle setting.
+- **The ANN path is gated by coordinator capacity, not the vector tier.**
+  Resizing the Data Store (i8g.xlarge → i8g.2xlarge) took peak ANN throughput
+  from 16,334 → 45,632 q/s. The Vector Search tier was never scaled.
+
+### ANN query scaling (client-observed, quiet cluster)
+
+Concurrency sweep with no write load, on the settled 3-node cluster. These are
+client-side, so they include network and client queuing:
+
+| concurrency | ANN queries/s | p50 ms | p99 ms |
+|------------:|--------------:|-------:|-------:|
+| 1    | 352    | **1.020** | 1.587 |
+| 16   | 2,106  | 1.616 | 3.690 |
+| 96   | 9,561  | 2.947 | 9.911 |
+| 256  | 19,730 | 3.262 | 11.087 |
+| 480  | 29,459 | 5.159 | 20.471 |
+| 1232 | **45,632** | 13.641 | 48.266 |
+
+0 errors, 0 empty, 0 short throughout; never saturated. A single ANN lookup over
+the whole population costs **p50 1.02 ms** — the same order as the feature point
+read, on the same cluster.
+
+**TODO:** re-run after scaling the Vector Search tier (still 2 × r7g.xlarge);
+and past ~137k writes/s the Data Store is the limit, so genuinely "hundreds of
+thousands with single-digit tails" is a data-node sizing question.
+
 ## Reproduce
 
 ```bash
@@ -145,4 +309,13 @@ PYTHONPATH=src .venv/bin/python -m feature_store.apply_schema --schema cql/schem
 PYTHONPATH=src .venv/bin/python -m feature_store.consumer --speed 0 --days 1 --sample-out sample_keys.csv
 PYTHONPATH=src .venv/bin/python -m feature_store.bench read --keys sample_keys.csv --n 600000 --procs 12 --threads 6
 PYTHONPATH=src .venv/bin/python -m feature_store.loadgen --procs 12 --days 1
+
+# webinar 2 — vector search (on the demo host, against Cloud)
+PYTHONPATH=src .venv/bin/python -m feature_store.apply_schema --schema cql/schema_vector.cql
+PYTHONPATH=src .venv/bin/python -m feature_store.vecgen --scope both   # 224k + 981k vectors
+PYTHONPATH=src .venv/bin/python -m feature_store.bench ann --n 40000 --procs 4 --threads 4
+PYTHONPATH=src .venv/bin/python -m feature_store.cloudmetrics          # server-side snapshot
+
+# the demo itself (from the laptop; needs FS_REMOTE + ~/.fs-cloud.env on the host)
+just cloud-dashboard          # 20 sim procs, ANN concurrency 16, embedding writes off
 ```
